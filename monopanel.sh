@@ -247,13 +247,13 @@ run_with_progress() {
   "$@" >>"$LOG_FILE" 2>&1 &
   local pid=$!
 
-  local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  local spin=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
   local i=0
   if [[ -t 1 ]]; then
     while kill -0 "$pid" 2>/dev/null; do
       elapsed=$(( $(date +%s) - start_ts ))
       printf "\r  ${C_CYAN}%s${C_RESET}  %s ${C_DIM}(%ss — see %s for live detail)${C_RESET}   " \
-        "${spin:i++%${#spin}:1}" "$label" "$elapsed" "$LOG_FILE"
+        "${spin[i++ % ${#spin[@]}]}" "$label" "$elapsed" "$LOG_FILE"
       sleep 0.2
     done
   else
@@ -493,6 +493,15 @@ gather_db_settings() {
   DB_PASS=$(ask_secret "Database password")
 }
 
+gather_redis_settings() {
+  echo
+  info "Redis configuration (used for cache/session/queue):"
+  REDIS_HOST=$(ask "Redis host" "127.0.0.1")
+  REDIS_PORT=$(ask "Redis port" "6379")
+  REDIS_PASS=$(ask_secret "Redis password (leave blank if none)")
+  [[ -z "$REDIS_PASS" ]] && REDIS_PASS="null"
+}
+
 gather_app_settings() {
   echo
   info "General application configuration:"
@@ -538,9 +547,9 @@ run_env_setup_commands() {
     --cache=redis \
     --session=redis \
     --queue=redis \
-    --redis-host=127.0.0.1 \
-    --redis-pass=null \
-    --redis-port=6379 \
+    --redis-host="$REDIS_HOST" \
+    --redis-pass="$REDIS_PASS" \
+    --redis-port="$REDIS_PORT" \
     --settings-ui=true \
     --telemetry=true \
     --no-interaction >>"$LOG_FILE" 2>&1 \
@@ -667,6 +676,7 @@ install_panel() {
   clone_or_update_repo
   configure_env_file
   gather_db_settings
+  gather_redis_settings
   gather_app_settings
   gather_admin_account
   build_backend
@@ -877,10 +887,11 @@ configure_nodes() {
 
   echo
   info "Fetching node ID for configuration export..."
-  local node_id
+  local node_id name_re
+  name_re=$(printf '%s' "$name" | sed 's/[][\.^$*+?(){}|\\]/\\&/g')
   node_id=$(php artisan p:node:list --format=json 2>/dev/null \
-    | grep -o "\"name\":\"${name}\"[^}]*\"id\":[0-9]*" \
-    | grep -o '"id":[0-9]*' | grep -o '[0-9]*' | tail -1)
+    | grep -oE "\{[^{}]*\"name\":\"${name_re}\"[^{}]*\}" \
+    | grep -oE '"id":[0-9]+' | grep -oE '[0-9]+' | tail -1)
 
   if [[ -z "$node_id" ]]; then
     warn "Could not auto-detect the new node's ID. Run 'php artisan p:node:list' to find it,"
