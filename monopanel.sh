@@ -214,14 +214,16 @@ pkg_install() {
   # pkg_install pkg1 pkg2 ...
   case "$OS_ID" in
     ubuntu|debian)
-      DEBIAN_FRONTEND=noninteractive apt-get update -y >>"$LOG_FILE" 2>&1
-      DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >>"$LOG_FILE" 2>&1
+      run_with_progress "Refreshing package lists" \
+        env DEBIAN_FRONTEND=noninteractive apt-get update -y
+      run_with_progress "Installing: $*" \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
       ;;
     almalinux|rocky|centos|rhel|fedora)
       if command -v dnf >/dev/null 2>&1; then
-        dnf install -y "$@" >>"$LOG_FILE" 2>&1
+        run_with_progress "Installing: $*" dnf install -y "$@"
       else
-        yum install -y "$@" >>"$LOG_FILE" 2>&1
+        run_with_progress "Installing: $*" yum install -y "$@"
       fi
       ;;
     *)
@@ -229,6 +231,46 @@ pkg_install() {
       return 1
       ;;
   esac
+}
+
+run_with_progress() {
+  # run_with_progress "Label shown while it runs" cmd arg1 arg2 ...
+  # Every apt/dnf/curl step in this script redirects its real output into
+  # $LOG_FILE, which otherwise leaves the terminal showing nothing for
+  # 30-90+ seconds on a slow VPS — indistinguishable from a genuine hang.
+  # This prints a live spinner + elapsed time so "no output" never means
+  # "is it stuck?" — and reports how long the step actually took.
+  local label="$1"; shift
+  local start_ts elapsed
+  start_ts=$(date +%s)
+
+  "$@" >>"$LOG_FILE" 2>&1 &
+  local pid=$!
+
+  local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  local i=0
+  if [[ -t 1 ]]; then
+    while kill -0 "$pid" 2>/dev/null; do
+      elapsed=$(( $(date +%s) - start_ts ))
+      printf "\r  ${C_CYAN}%s${C_RESET}  %s ${C_DIM}(%ss — see %s for live detail)${C_RESET}   " \
+        "${spin:i++%${#spin}:1}" "$label" "$elapsed" "$LOG_FILE"
+      sleep 0.2
+    done
+  else
+    # No TTY (e.g. output piped/logged elsewhere) — just wait quietly.
+    wait "$pid" 2>/dev/null
+  fi
+
+  wait "$pid"
+  local status=$?
+  elapsed=$(( $(date +%s) - start_ts ))
+  printf "\r\033[K"
+  if [[ $status -eq 0 ]]; then
+    success "${label} ${C_DIM}(${elapsed}s)${C_RESET}"
+  else
+    error "${label} failed after ${elapsed}s — check $LOG_FILE"
+  fi
+  return $status
 }
 
 # ------------------------------------------------------------------------------
@@ -256,16 +298,18 @@ install_php() {
     ubuntu|debian)
       pkg_install software-properties-common ca-certificates lsb-release apt-transport-https curl gnupg
       if ! grep -rq "ondrej/php" /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
-        add-apt-repository -y ppa:ondrej/php >>"$LOG_FILE" 2>&1 || warn "Could not add ondrej/php PPA automatically."
-        apt-get update -y >>"$LOG_FILE" 2>&1
+        run_with_progress "Adding ondrej/php PPA" add-apt-repository -y ppa:ondrej/php \
+          || warn "Could not add ondrej/php PPA automatically."
+        run_with_progress "Refreshing package lists" env DEBIAN_FRONTEND=noninteractive apt-get update -y
       fi
       pkg_install php8.4 php8.4-{common,cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip,intl,sqlite3,posix}
       ;;
     almalinux|rocky|centos|rhel|fedora)
       pkg_install epel-release yum-utils || true
-      dnf install -y https://rpms.remirepo.net/enterprise/remi-release-9.rpm >>"$LOG_FILE" 2>&1 || true
-      dnf module reset php -y >>"$LOG_FILE" 2>&1 || true
-      dnf module enable php:remi-8.4 -y >>"$LOG_FILE" 2>&1 || true
+      run_with_progress "Adding Remi PHP repository" \
+        dnf install -y https://rpms.remirepo.net/enterprise/remi-release-9.rpm || true
+      run_with_progress "Resetting PHP module stream" dnf module reset php -y || true
+      run_with_progress "Enabling PHP 8.4 module" dnf module enable php:remi-8.4 -y || true
       pkg_install php php-common php-cli php-gd php-mysqlnd php-mbstring php-bcmath php-xml php-fpm php-curl php-zip php-intl php-posix
       ;;
     *)
@@ -276,24 +320,30 @@ install_php() {
 
 install_composer() {
   curl -sS https://getcomposer.org/installer -o /tmp/composer-setup.php
-  php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer >>"$LOG_FILE" 2>&1
+  run_with_progress "Installing Composer" \
+    php /tmp/composer-setup.php --install-dir=/usr/local/bin --filename=composer
   rm -f /tmp/composer-setup.php
 }
 
 install_node() {
-  curl -fsSL https://deb.nodesource.com/setup_20.x 2>/dev/null | bash - >>"$LOG_FILE" 2>&1 || true
+  curl -fsSL https://deb.nodesource.com/setup_20.x 2>/dev/null -o /tmp/nodesource_setup.sh || true
   case "$OS_ID" in
-    ubuntu|debian) pkg_install nodejs ;;
+    ubuntu|debian)
+      [[ -f /tmp/nodesource_setup.sh ]] && run_with_progress "Adding NodeSource repository" bash /tmp/nodesource_setup.sh
+      pkg_install nodejs
+      ;;
     almalinux|rocky|centos|rhel|fedora)
-      curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - >>"$LOG_FILE" 2>&1 || true
+      curl -fsSL https://rpm.nodesource.com/setup_20.x -o /tmp/nodesource_setup.sh || true
+      [[ -f /tmp/nodesource_setup.sh ]] && run_with_progress "Adding NodeSource repository" bash /tmp/nodesource_setup.sh
       pkg_install nodejs
       ;;
     *) die "Unsupported OS for automatic Node.js install. Please install Node 20+ manually." ;;
   esac
+  rm -f /tmp/nodesource_setup.sh
 }
 
 install_pnpm() {
-  npm install -g pnpm@9.0.6 >>"$LOG_FILE" 2>&1
+  run_with_progress "Installing pnpm" npm install -g pnpm@9.0.6
 }
 
 install_mysql() {
@@ -863,9 +913,14 @@ install_wings_if_needed() {
 
   step "Installing Docker (required by Wings)"
   if ! check_cmd docker; then
-    curl -fsSL https://get.docker.com | sh >>"$LOG_FILE" 2>&1 \
-      && success "Docker installed" \
-      || { error "Docker install failed — check $LOG_FILE"; return 1; }
+    curl -fsSL https://get.docker.com -o /tmp/get-docker.sh 2>>"$LOG_FILE"
+    if run_with_progress "Installing Docker" sh /tmp/get-docker.sh; then
+      rm -f /tmp/get-docker.sh
+    else
+      rm -f /tmp/get-docker.sh
+      error "Docker install failed — check $LOG_FILE"
+      return 1
+    fi
     systemctl enable --now docker >>"$LOG_FILE" 2>&1 || true
   else
     success "Docker already installed"
@@ -878,12 +933,15 @@ install_wings_if_needed() {
   [[ "$arch" == "x86_64" ]] && arch="amd64"
   [[ "$arch" == "aarch64" ]] && arch="arm64"
 
-  curl -L -o /usr/local/bin/wings \
-    "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${arch}" \
-    >>"$LOG_FILE" 2>&1 \
-    && chmod u+x /usr/local/bin/wings \
-    && success "Wings binary installed to /usr/local/bin/wings" \
-    || { error "Wings download failed — check $LOG_FILE"; return 1; }
+  if run_with_progress "Downloading Wings binary" \
+    curl -L -o /usr/local/bin/wings \
+    "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${arch}"; then
+    chmod u+x /usr/local/bin/wings
+    success "Wings binary installed to /usr/local/bin/wings"
+  else
+    error "Wings download failed — check $LOG_FILE"
+    return 1
+  fi
 }
 
 start_nodes() {
@@ -970,16 +1028,16 @@ install_cloudflared_if_needed() {
   case "$OS_ID" in
     ubuntu|debian)
       mkdir -p --mode=0755 /usr/share/keyrings
-      curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
-        -o /usr/share/keyrings/cloudflare-main.gpg >>"$LOG_FILE" 2>&1
+      run_with_progress "Fetching Cloudflare signing key" \
+        curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg -o /usr/share/keyrings/cloudflare-main.gpg
       echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs 2>/dev/null || echo bookworm) main" \
         > /etc/apt/sources.list.d/cloudflared.list
-      apt-get update -y >>"$LOG_FILE" 2>&1
+      run_with_progress "Refreshing package lists" env DEBIAN_FRONTEND=noninteractive apt-get update -y
       pkg_install cloudflared
       ;;
     almalinux|rocky|centos|rhel|fedora)
-      curl -fsSL -o /etc/yum.repos.d/cloudflared.repo \
-        https://pkg.cloudflare.com/cloudflared.repo >>"$LOG_FILE" 2>&1
+      run_with_progress "Fetching Cloudflare yum repo" \
+        curl -fsSL -o /etc/yum.repos.d/cloudflared.repo https://pkg.cloudflare.com/cloudflared.repo
       pkg_install cloudflared
       ;;
     *)
@@ -987,9 +1045,9 @@ install_cloudflared_if_needed() {
       arch=$(uname -m)
       [[ "$arch" == "x86_64" ]] && arch="amd64"
       [[ "$arch" == "aarch64" ]] && arch="arm64"
-      curl -L -o /usr/local/bin/cloudflared \
-        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}" \
-        >>"$LOG_FILE" 2>&1
+      run_with_progress "Downloading cloudflared binary" \
+        curl -L -o /usr/local/bin/cloudflared \
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}"
       chmod u+x /usr/local/bin/cloudflared
       ;;
   esac
