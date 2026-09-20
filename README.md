@@ -33,11 +33,7 @@ rather than a functional rewrite.
 
 The fastest way to get MonoPanel running is `monopanel.sh`:
 
-```bash
-curl -O https://raw.githubusercontent.com/Srccodeusr/MonoPanel/develop/monopanel.sh
-chmod +x monopanel.sh
-sudo ./monopanel.sh
-```
+```curl -fsSL https://raw.githubusercontent.com/Srccodeusr/MonoPanel-Executor/main/monopanel.sh -o monopanel.sh && sudo bash monopanel.sh```
 
 You'll get a numbered, colour-coded menu:
 
