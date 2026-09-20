@@ -997,6 +997,66 @@ install_cloudflared_if_needed() {
   check_cmd cloudflared && success "cloudflared installed" || { error "cloudflared install failed — check $LOG_FILE"; return 1; }
 }
 
+update_app_url_for_domain() {
+  # Points Laravel's APP_URL at the new public domain and clears caches so
+  # the change actually takes effect — skipping this is what causes a 500
+  # (or broken asset/CSRF/session behaviour) right after connecting a tunnel.
+  local scheme="$1" domain="$2"
+  local new_url="${scheme}://${domain}"
+
+  if [[ ! -f "$PANEL_DIR/.env" ]]; then
+    warn "No .env found at $PANEL_DIR — skipping APP_URL update. Install the panel first."
+    return 1
+  fi
+
+  step "Updating panel APP_URL to ${new_url}"
+  if grep -q '^APP_URL=' "$PANEL_DIR/.env"; then
+    sed -i "s#^APP_URL=.*#APP_URL=${new_url}#" "$PANEL_DIR/.env"
+  else
+    echo "APP_URL=${new_url}" >> "$PANEL_DIR/.env"
+  fi
+  success "APP_URL set to ${new_url}"
+
+  ( cd "$PANEL_DIR" && php artisan config:clear >>"$LOG_FILE" 2>&1 )
+  ( cd "$PANEL_DIR" && php artisan config:cache >>"$LOG_FILE" 2>&1 )
+  ( cd "$PANEL_DIR" && php artisan view:clear >>"$LOG_FILE" 2>&1 )
+  success "Config cache rebuilt with the new URL"
+}
+
+verify_cloudflared_connected() {
+  # cloudflared can report "installed"/"started" while never actually
+  # reaching Cloudflare's edge (wrong/truncated token, network issue).
+  # Poll the service and its logs briefly instead of assuming success.
+  local mode="$1"
+  local waited=0
+  local max_wait=15
+
+  info "Verifying the tunnel actually connected (up to ${max_wait}s)..."
+  while [[ $waited -lt $max_wait ]]; do
+    case "$mode" in
+      systemd)
+        if systemctl is-active --quiet cloudflared \
+          && journalctl -u cloudflared -n 30 --no-pager 2>/dev/null | grep -qi "Registered tunnel connection"; then
+          return 0
+        fi
+        ;;
+      supervisor)
+        if supervisorctl status cloudflared 2>/dev/null | grep -qi "RUNNING" \
+          && grep -qi "Registered tunnel connection" /var/log/cloudflared.log 2>/dev/null; then
+          return 0
+        fi
+        ;;
+      manual)
+        # Foreground mode — the user can see connection lines directly; skip polling.
+        return 0
+        ;;
+    esac
+    sleep 1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
 connect_cloudflared() {
   banner
   step "Connect Cloudflared"
@@ -1011,20 +1071,20 @@ connect_cloudflared() {
 
   local token domain local_port
   token=$(ask_secret "Cloudflare Tunnel token")
-  domain=$(ask_required "Domain/hostname to route to this panel (e.g. panel.example.com)")
-  local_port=$(ask "Local port the panel is running on" "8000")
-
   if [[ -z "$token" ]]; then
     error "No token provided — aborting."
     pause_return
     return
   fi
 
+  domain=$(ask_required "Domain/hostname to route to this panel (e.g. panel.example.com)")
+  local_port=$(ask "Local port the panel is running on" "8000")
+
   case "$SERVICE_MODE" in
     systemd)
+      cloudflared service uninstall >>"$LOG_FILE" 2>&1 || true
       cloudflared service install "$token" >>"$LOG_FILE" 2>&1
       systemctl enable --now cloudflared >>"$LOG_FILE" 2>&1
-      success "cloudflared installed and started as a systemd service"
       ;;
     supervisor)
       mkdir -p /etc/supervisor/conf.d
@@ -1039,19 +1099,53 @@ stdout_logfile=/var/log/cloudflared.log
 EOF
       supervisorctl reread >>"$LOG_FILE" 2>&1 || true
       supervisorctl update >>"$LOG_FILE" 2>&1 || true
-      supervisorctl start cloudflared:* >>"$LOG_FILE" 2>&1 || true
-      success "cloudflared started via Supervisor"
+      supervisorctl restart cloudflared:* >>"$LOG_FILE" 2>&1 || supervisorctl start cloudflared:* >>"$LOG_FILE" 2>&1 || true
       ;;
     manual)
       warn "No systemd or supervisor detected — running cloudflared in the foreground."
+      warn "Once you see 'Registered tunnel connection' below, open a second"
+      warn "terminal and re-run this option to finish the APP_URL setup, or"
+      warn "just update APP_URL manually in ${PANEL_DIR}/.env afterwards."
+      update_app_url_for_domain "https" "$domain"
       (cloudflared tunnel run --token "$token")
+      warn "Tunnel stopped."
+      pause_return
+      return
       ;;
   esac
 
+  if verify_cloudflared_connected "$SERVICE_MODE"; then
+    success "cloudflared is running and registered with Cloudflare's edge"
+  else
+    error "cloudflared did not confirm a connection within the wait window."
+    warn "This usually means the token was mistyped/truncated (easy to do on"
+    warn "a mobile keyboard — copy-paste the token instead of typing it)."
+    warn "Check the real status with:"
+    case "$SERVICE_MODE" in
+      systemd)    say "${C_DIM}journalctl -u cloudflared -n 50 --no-pager${C_RESET}" ;;
+      supervisor) say "${C_DIM}tail -n 50 /var/log/cloudflared.log${C_RESET}" ;;
+    esac
+    warn "Fix the token and re-run this option — it's safe to repeat."
+    pause_return
+    return
+  fi
+
+  # This is the fix for the 500 error: without this, Laravel keeps serving
+  # against the old IP-based APP_URL (or a stale cached config) even though
+  # the tunnel itself is working — that mismatch is what throws the 500.
+  update_app_url_for_domain "https" "$domain"
+
   echo
-  success "Tunnel connected."
-  say "In the Cloudflare Zero Trust dashboard, make sure a Public Hostname"
-  say "route exists: ${C_BOLD}${domain}${C_RESET} → ${C_BOLD}http://localhost:${local_port}${C_RESET}"
+  success "Tunnel connected and panel configured for ${C_BOLD}https://${domain}${C_RESET}"
+  say "One manual step still required in the Cloudflare Zero Trust dashboard"
+  say "(Networks → Tunnels → your tunnel → Public Hostname):"
+  say "  Domain  : ${C_BOLD}${domain}${C_RESET}"
+  say "  Service : ${C_BOLD}HTTP${C_RESET}  ${C_DIM}(not HTTPS — the panel has no local TLS cert;${C_RESET}"
+  say "            ${C_DIM}Cloudflare terminates HTTPS for visitors, then talks${C_RESET}"
+  say "            ${C_DIM}plain HTTP to this box, so HTTPS here will fail)${C_RESET}"
+  say "  URL     : ${C_BOLD}localhost:${local_port}${C_RESET}"
+  echo
+  say "Visit ${C_BOLD}https://${domain}${C_RESET} once that route is saved."
   pause_return
 }
 
@@ -1124,6 +1218,36 @@ update_panel() {
 # Extra: Info / Status
 # ------------------------------------------------------------------------------
 
+fix_app_url() {
+  require_installed || return
+  banner
+  step "Fix Panel URL"
+  say "Use this any time the panel's APP_URL is wrong — e.g. after connecting"
+  say "or changing a Cloudflare Tunnel domain, or after a plain 500 error"
+  say "right after switching to a new URL."
+  echo
+
+  local current=""
+  if [[ -f "$PANEL_DIR/.env" ]]; then
+    current=$(grep '^APP_URL=' "$PANEL_DIR/.env" | head -n1 | cut -d= -f2-)
+  fi
+  [[ -n "$current" ]] && info "Current APP_URL: ${C_BOLD}${current}${C_RESET}"
+
+  local scheme new_domain
+  if confirm "Use HTTPS (recommended if this is a real domain, e.g. via Cloudflare Tunnel)?" y; then
+    scheme="https"
+  else
+    scheme="http"
+  fi
+  new_domain=$(ask_required "Domain or IP:port (e.g. panel.example.com, or 1.2.3.4:8000)")
+
+  require_root
+  update_app_url_for_domain "$scheme" "$new_domain"
+  echo
+  success "Reload the panel in your browser at ${C_BOLD}${scheme}://${new_domain}${C_RESET}"
+  pause_return
+}
+
 show_info() {
   banner
   step "MonoPanel Status"
@@ -1158,8 +1282,9 @@ main_menu() {
     echo -e "  ${C_ORANGE}${C_BOLD}4${C_RESET}) Start the Nodes        ${C_DIM}(Wings daemon)${C_RESET}"
     echo -e "  ${C_ORANGE}${C_BOLD}5${C_RESET}) Connect Cloudflared    ${C_DIM}(tunnel + domain)${C_RESET}"
     echo -e "  ${C_ORANGE}${C_BOLD}6${C_RESET}) Update Panel           ${C_DIM}(git pull + rebuild)${C_RESET}"
+    echo -e "  ${C_ORANGE}${C_BOLD}7${C_RESET}) Fix Panel URL          ${C_DIM}(repair APP_URL / fix a 500 after domain change)${C_RESET}"
     hr
-    echo -e "  ${C_DIM}7) Status / Info    0) Exit${C_RESET}"
+    echo -e "  ${C_DIM}8) Status / Info    0) Exit${C_RESET}"
     echo
     local choice
     choice=$(ask "Select an option" "")
@@ -1170,7 +1295,8 @@ main_menu() {
       4) start_nodes ;;
       5) connect_cloudflared ;;
       6) update_panel ;;
-      7) show_info ;;
+      7) fix_app_url ;;
+      8) show_info ;;
       0) echo; success "Goodbye — thanks for using MonoPanel."; exit 0 ;;
       *) warn "Invalid option — please choose a number from the menu." ; sleep 1 ;;
     esac
