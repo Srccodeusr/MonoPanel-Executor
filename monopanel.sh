@@ -18,25 +18,30 @@
 #  Panel base   : Jexactyl / Pterodactyl (MIT) — full credit to the original
 #                 authors and community.
 #
-#  Usage
-#    sudo bash monopanel.sh                 # interactive menu
-#    sudo bash monopanel.sh <command>       # run one action and exit
+#  One-liner (VPS, Codespaces, CodeSandbox, Gitpod, containers, hosted servers)
+#    curl -fsSL https://raw.githubusercontent.com/Srccodeusr/MonoPanel-Executor/main/monopanel.sh | bash
+#  Fully automatic — no menu, no questions:
+#    curl -fsSL https://raw.githubusercontent.com/Srccodeusr/MonoPanel-Executor/main/monopanel.sh | bash -s -- auto
+#  Afterwards just type:  monopanel
 #
-#  Commands
-#    install | run-prod | run-dev | stop | restart | update | admin
-#    node-setup | node-start | node-stop | node-sync | tunnel | status
-#    logs | backup | self-update | help
+#  Commands:  auto | install | run-prod | run-dev | stop | restart | update | admin
+#             node-setup | node-start | node-stop | node-sync | tunnel
+#             status | logs | backup | self-update | help
+#
+#  Works with or without root and with or without systemd:
+#    root/sudo  -> system packages (PHP-FPM + nginx + MariaDB + Redis), systemd units
+#                  when systemd runs, otherwise a built-in restarting supervisor
+#    no root    -> portable runtime: FrankenPHP (PHP + web server in one static
+#                  binary) + Node tarball, external MySQL/MariaDB database
 #
 #  Useful environment variables (all optional)
-#    MONOPANEL_REPO        panel git URL          (default: Srccodeusr/MonoPanel)
-#    MONOPANEL_BRANCH      panel git branch       (default: develop)
-#    MONOPANEL_DIR         where the panel lives  (default: /var/www/monopanel)
-#    MONOPANEL_HOME        state/logs/pids dir    (default: /var/lib/monopanel)
-#    MONOPANEL_GIT_TOKEN   GitHub token if the panel repo is private
-#    MONOPANEL_SCRIPT_URL  raw URL of this script (enables "Update this script")
+#    MP_PORT, MP_URL, MP_TZ, MP_ADMIN_EMAIL, MP_ADMIN_USER, MP_ADMIN_PASSWORD
+#    MP_DB_URL             mysql://user:pass@host:3306/db (when no local DB is possible)
+#    MP_PORTABLE=1         force the no-root portable runtime
 #    MP_INIT               force service backend: systemd | builtin
 #    MP_ASSUME_DEFAULTS=1  never prompt, accept every default (automation)
-#    MP_BUILD_MEM          Node heap (MB) used for the frontend build
+#    MONOPANEL_REPO / _BRANCH / _DIR / _HOME / _GIT_TOKEN / _SCRIPT_URL
+#    MP_BUILD_MEM          Node heap (MB) for the frontend build
 #    MP_VITE_PUBLIC_URL    public URL of the Vite dev server (remote dev mode)
 # ============================================================================
 
@@ -194,6 +199,8 @@ init_env() {
     DEF_PANEL_DIR="${HOME:-/tmp}/monopanel"
     PATH="$BIN_DIR:$PATH"
   fi
+  # user-space tools we may download (portable Node / pnpm / PHP wrapper)
+  PATH="$MP_HOME/opt/node/bin:$MP_HOME/opt/pnpm/node_modules/.bin:$MP_HOME/opt/bin:$PATH"
   CONFIG_FILE="$MP_HOME/config.env"
   SVC_DIR="$MP_HOME/services"
   INSTALL_LOG="$LOG_DIR/install.log"
@@ -211,6 +218,8 @@ init_env() {
   PANEL_REPO="${MONOPANEL_REPO:-$(cfg_get PANEL_REPO "$REPO_URL_DEFAULT")}"
   PANEL_BRANCH="${MONOPANEL_BRANCH:-$(cfg_get PANEL_BRANCH "$BRANCH_DEFAULT")}"
   PANEL_PORT="$(cfg_get PANEL_PORT "")"
+  PHP_MODE="$(cfg_get PHP_MODE "")"        # system | portable (decided at install time)
+  FRANKEN_BIN="$MP_HOME/opt/frankenphp/frankenphp"
   SCRIPT_URL="${MONOPANEL_SCRIPT_URL:-$(cfg_get SCRIPT_URL "$SCRIPT_URL_DEFAULT")}"
   FPM_PORT="$(cfg_get FPM_PORT 9074)"
   VITE_PORT="$(cfg_get VITE_PORT 5173)"
@@ -250,6 +259,74 @@ detect_system() {
   IN_CONTAINER=0
   if [[ -f /.dockerenv || -f /run/.containerenv ]]; then IN_CONTAINER=1
   elif grep -qaE 'docker|lxc|kubepods|containerd' /proc/1/cgroup 2>/dev/null; then IN_CONTAINER=1; fi
+
+  # Can we install system packages? (root + a package manager we know)
+  CAN_INSTALL=0
+  if (( IS_ROOT )) && [[ $PKG == apt || $PKG == dnf || $PKG == yum || $PKG == apk ]]; then CAN_INSTALL=1; fi
+  if [[ ${MP_PLATFORM:-vps} == vps ]] && (( IN_CONTAINER )); then MP_PLATFORM="container"; fi
+}
+
+# Which kind of machine is this?  (env-only, so it survives `sudo -E`)
+detect_platform() {
+  if [[ -n ${MP_PLATFORM:-} ]]; then return 0; fi
+  MP_PLATFORM="vps"
+  if   [[ -n ${CODESPACES:-} || -n ${CODESPACE_NAME:-} ]]; then MP_PLATFORM="codespaces"
+  elif [[ -n ${GITPOD_WORKSPACE_ID:-} ]]; then MP_PLATFORM="gitpod"
+  elif [[ -n ${CSB_BASE_PREVIEW_HOST:-} || -n ${CODESANDBOX_HOST:-} || "${CSB:-}" == "true" ]]; then MP_PLATFORM="codesandbox"
+  elif [[ -n ${REPL_ID:-} || -n ${REPL_SLUG:-} ]]; then MP_PLATFORM="replit"
+  elif [[ -n ${P_SERVER_UUID:-} || ( -n ${SERVER_PORT:-} && -n ${SERVER_MEMORY:-} ) ]]; then MP_PLATFORM="pterodactyl"
+  fi
+  export MP_PLATFORM
+}
+
+platform_label() {
+  case "${MP_PLATFORM:-vps}" in
+    codespaces)  echo "GitHub Codespaces" ;;
+    gitpod)      echo "Gitpod" ;;
+    codesandbox) echo "CodeSandbox" ;;
+    replit)      echo "Replit" ;;
+    pterodactyl) echo "Pterodactyl/Jexactyl-hosted container" ;;
+    container)   echo "container" ;;
+    *)           echo "VPS / server" ;;
+  esac
+}
+
+# Sandboxes put a TLS-terminating proxy in front of us.
+behind_platform_proxy() { case "${MP_PLATFORM:-vps}" in codespaces|gitpod|codesandbox|replit) return 0 ;; *) return 1 ;; esac; }
+
+platform_url() {  # platform_url <port> -> the public URL of that port, or nothing when unknown
+  local port="$1"
+  case "${MP_PLATFORM:-vps}" in
+    codespaces)
+      [[ -n ${CODESPACE_NAME:-} ]] && printf 'https://%s-%s.%s' "$CODESPACE_NAME" "$port" "${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}" ;;
+    gitpod)
+      [[ -n ${GITPOD_WORKSPACE_ID:-} && -n ${GITPOD_WORKSPACE_CLUSTER_HOST:-} ]] && printf 'https://%s-%s.%s' "$port" "$GITPOD_WORKSPACE_ID" "$GITPOD_WORKSPACE_CLUSTER_HOST" ;;
+    codesandbox)  # best effort: <sandbox id>-<port>.<preview host>
+      [[ -n ${CSB_BASE_PREVIEW_HOST:-} ]] && printf 'https://%s-%s.%s' "${CSB_SANDBOX_ID:-$(hostname 2>/dev/null)}" "$port" "$CSB_BASE_PREVIEW_HOST" ;;
+    pterodactyl)
+      if [[ -n ${SERVER_IP:-} && ${SERVER_IP} != 0.0.0.0 ]]; then printf 'http://%s:%s' "$SERVER_IP" "$port"; fi ;;
+  esac
+  return 0
+}
+
+first_free_port() {  # first_free_port 8080 8081 ...
+  local p
+  for p in "$@"; do port_in_use "$p" || { printf '%s' "$p"; return 0; }; done
+  printf '%s' "$1"
+}
+
+# Local MariaDB is only possible when we can install packages (or it is already there).
+local_db_possible() { (( CAN_INSTALL )) || { (( IS_ROOT )) && command -v mariadbd >/dev/null 2>&1; }; }
+
+rand_key() {  # 32 random bytes, base64 (Laravel APP_KEY payload)
+  if command -v openssl >/dev/null 2>&1; then openssl rand -base64 32
+  else head -c 32 /dev/urandom | base64; fi
+}
+
+download() {  # download <url> <dest>   (progress bar on a terminal)
+  local url="$1" dest="$2"
+  if [[ -t 2 ]]; then curl -fL --retry 3 --retry-delay 2 -# -o "$dest" "$url"
+  else curl -fsSL --retry 3 --retry-delay 2 -o "$dest" "$url"; fi
 }
 
 # Is a real systemd running as PID 1?  (MP_INIT=builtin|systemd overrides)
@@ -431,19 +508,22 @@ pkg_install_logged() {  # pkg_install_logged "Label" pkgs...
 pkg_install_optional() { pkg_install "$@" || warn "Optional package(s) unavailable: $*"; return 0; }
 
 ensure_base_deps() {
-  step "Base packages"
+  step "Base tools"
   local need=() c
-  for c in curl git tar unzip openssl; do command -v "$c" >/dev/null 2>&1 || need+=("$c"); done
-  [[ -d /etc/ssl/certs ]] || need+=(ca-certificates)
-  if [[ $PKG == apk ]]; then command -v bash >/dev/null 2>&1 || need+=(bash); fi
+  for c in curl git tar; do command -v "$c" >/dev/null 2>&1 || need+=("$c"); done
+  # helpers that only matter when we can install packages the classic way
+  if (( CAN_INSTALL )); then
+    for c in unzip openssl; do command -v "$c" >/dev/null 2>&1 || need+=("$c"); done
+    [[ -d /etc/ssl/certs ]] || need+=(ca-certificates)
+    if [[ $PKG == apk ]]; then command -v bash >/dev/null 2>&1 || need+=(bash); fi
+  fi
   if (( ${#need[@]} == 0 )); then
-    success "curl, git, tar, unzip, openssl already present."
+    success "Required tools present (curl, git, tar)."
     return 0
   fi
-  need_root "Installing packages (${need[*]})" || return 1
-  if [[ $PKG == none ]]; then
-    error "Missing: ${need[*]} — and no supported package manager (apt/dnf/yum/apk) was found."
-    warn "Install PHP >= 8.4 (+fpm), Composer, Node >= 18, nginx, MariaDB, git, curl manually, then re-run."
+  if (( ! CAN_INSTALL )); then
+    error "Missing tools: ${need[*]} — and this machine has no root/package manager to install them."
+    note "Ask the host to provide them (or run in an image that has curl, git and tar)."
     return 1
   fi
   pkg_install_logged "Installing: ${need[*]}" "${need[@]}"
@@ -691,9 +771,17 @@ detect_fpm() {
   return 1
 }
 
-missing_php_exts() {
+use_portable_php() { [[ "${PHP_MODE:-}" == "portable" ]]; }
+
+missing_php_exts() {  # prints the REQUIRED extensions that are missing
   [[ -n ${PHP_BIN:-} ]] || return 0
-  "$PHP_BIN" -r '$need = ["bcmath","ctype","curl","dom","fileinfo","gd","mbstring","openssl","pdo","pdo_mysql","posix","tokenizer","xml","zip","intl"];
+  "$PHP_BIN" -r '$need = ["ctype","curl","dom","fileinfo","mbstring","openssl","pdo","pdo_mysql","posix","tokenizer","xml"];
+    $m = []; foreach ($need as $e) { if (!extension_loaded($e)) { $m[] = $e; } } echo implode(" ", $m);' 2>/dev/null
+}
+
+missing_php_extras() {  # recommended (the panel works without them, some features may not)
+  [[ -n ${PHP_BIN:-} ]] || return 0
+  "$PHP_BIN" -r '$need = ["bcmath","gd","intl","zip"];
     $m = []; foreach ($need as $e) { if (!extension_loaded($e)) { $m[] = $e; } } echo implode(" ", $m);' 2>/dev/null
 }
 
@@ -747,7 +835,53 @@ install_php_apk() {
   return 0
 }
 
+frankenphp_urls() {  # candidate download URLs (first that works wins)
+  local a
+  if [[ -n ${MP_FRANKENPHP_URL:-} ]]; then echo "$MP_FRANKENPHP_URL"; return 0; fi
+  case "$ARCH_RAW" in x86_64|amd64) a="x86_64" ;; aarch64|arm64) a="aarch64" ;; *) return 1 ;; esac
+  echo "https://github.com/php/frankenphp/releases/latest/download/frankenphp-linux-${a}"
+  echo "https://github.com/dunglas/frankenphp/releases/latest/download/frankenphp-linux-${a}"
+}
+
+# Portable PHP: FrankenPHP is ONE static binary = PHP 8.4 CLI + a production web server.
+# No root, no apt, works on any Linux (glibc or musl) — perfect for sandboxes and hosted containers.
+install_php_portable() {
+  step "PHP — portable build (FrankenPHP static binary, no root needed)"
+  local dir="$MP_HOME/opt/frankenphp" obin="$MP_HOME/opt/bin" u ok=0
+  mkdir -p "$dir" "$obin"
+  FRANKEN_BIN="$dir/frankenphp"
+  if [[ ! -x $FRANKEN_BIN ]]; then
+    info "Downloading FrankenPHP (PHP + web server in one file, ~100 MB)…"
+    while read -r u; do
+      if download "$u" "$FRANKEN_BIN.part" 2>>"$INSTALL_LOG"; then ok=1; break; fi
+    done < <(frankenphp_urls)
+    if (( ! ok )); then
+      rm -f "$FRANKEN_BIN.part"
+      error "Could not download FrankenPHP for $ARCH_RAW (see $INSTALL_LOG)."
+      note "Supported: linux x86_64 and aarch64. You can also set MP_FRANKENPHP_URL to a mirror."
+      return 1
+    fi
+    chmod 755 "$FRANKEN_BIN.part" && mv -f "$FRANKEN_BIN.part" "$FRANKEN_BIN"
+  fi
+  # `php` wrapper so every artisan/composer call works like a normal PHP CLI
+  printf '#!/usr/bin/env bash\nexec %q php-cli "$@"\n' "$FRANKEN_BIN" > "$obin/php"
+  chmod 755 "$obin/php"
+  PHP_BIN="$obin/php"; FPM_BIN=""; NGINX_BIN=""
+  if ! "$PHP_BIN" -r 'exit(PHP_VERSION_ID >= 80400 ? 0 : 1);' >>"$INSTALL_LOG" 2>&1; then
+    error "The downloaded PHP does not run here (or is older than 8.4). See $INSTALL_LOG"
+    "$PHP_BIN" -v 2>&1 | head -n 3 | sed 's/^/    /'
+    return 1
+  fi
+  success "PHP $("$PHP_BIN" -r 'echo PHP_VERSION;') (portable) → $FRANKEN_BIN"
+  local miss; miss="$(missing_php_exts)"
+  if [[ -n $miss ]]; then error "This PHP build lacks required extensions: $miss"; return 1; fi
+  miss="$(missing_php_extras)"
+  [[ -n $miss ]] && warn "Optional PHP extensions not present: $miss (panel still works)"
+  return 0
+}
+
 install_php() {
+  if use_portable_php; then install_php_portable; return $?; fi
   step "PHP >= 8.4 (+ php-fpm)"
   detect_php; detect_fpm
   local miss=""
@@ -769,6 +903,8 @@ install_php() {
   if [[ -n $miss ]]; then error "Missing PHP extensions: $miss"; return 1; fi
   if [[ -z ${FPM_BIN:-} ]]; then error "php-fpm binary not found (install the php-fpm package)."; return 1; fi
   success "php-fpm → $FPM_BIN"
+  miss="$(missing_php_extras)"
+  [[ -n $miss ]] && warn "Optional PHP extensions not present: $miss"
   return 0
 }
 
@@ -804,13 +940,40 @@ ensure_pnpm() {
     command -v pnpm >/dev/null 2>&1 && return 0
   fi
   run_root npm install -g pnpm@9 >>"$INSTALL_LOG" 2>&1
+  command -v pnpm >/dev/null 2>&1 && return 0
+  # no permission to install globally → private copy inside our own folder
+  mkdir -p "$MP_HOME/opt/pnpm"
+  npm install --prefix "$MP_HOME/opt/pnpm" pnpm@9 >>"$INSTALL_LOG" 2>&1
+  PATH="$MP_HOME/opt/pnpm/node_modules/.bin:$PATH"
   command -v pnpm >/dev/null 2>&1
+}
+
+install_node_portable() {  # official Node tarball into our own folder — no root needed
+  local a base file dir="$MP_HOME/opt/node" out
+  case "$ARCH_RAW" in x86_64|amd64) a="x64" ;; aarch64|arm64) a="arm64" ;; armv7l) a="armv7l" ;; *) error "No portable Node build for $ARCH_RAW."; return 1 ;; esac
+  out="$(ldd --version 2>&1 || true)"
+  if [[ $out == *musl* ]]; then error "musl Linux (Alpine): install Node with the distro package (apk add nodejs npm)."; return 1; fi
+  base="${MP_NODE_DIST_URL:-https://nodejs.org/dist/latest-v22.x}"
+  info "Downloading Node.js (portable, no root)…"
+  file="$(curl -fsSL "$base/SHASUMS256.txt" 2>>"$INSTALL_LOG" | awk -v s="linux-${a}.tar.gz" '{ n = length($2); m = length(s); if (n >= m && substr($2, n - m + 1) == s) { print $2; exit } }')"
+  [[ -n $file ]] || { error "Could not find a Node.js build at $base (see $INSTALL_LOG)."; return 1; }
+  mkdir -p "$MP_HOME/tmp"
+  download "$base/$file" "$MP_HOME/tmp/node.tgz" 2>>"$INSTALL_LOG" || { error "Node.js download failed."; return 1; }
+  rm -rf "$dir"; mkdir -p "$dir"
+  tar -xzf "$MP_HOME/tmp/node.tgz" -C "$dir" --strip-components=1 >>"$INSTALL_LOG" 2>&1 || { error "Could not unpack Node.js."; return 1; }
+  rm -f "$MP_HOME/tmp/node.tgz"
+  PATH="$dir/bin:$PATH"
+  return 0
 }
 
 install_node() {
   step "Node.js (>= 18) + pnpm"
   local major=0
   command -v node >/dev/null 2>&1 && major="$(node_major)"
+  if (( ${major:-0} < 18 )) && { use_portable_php || (( ! CAN_INSTALL )) || [[ ${MP_PORTABLE:-0} == 1 ]]; }; then
+    install_node_portable || return 1
+    major="$(node_major)"
+  fi
   if (( ${major:-0} < 18 )); then
     need_root "Installing Node.js" || return 1
     case "$PKG" in
@@ -836,6 +999,7 @@ install_node() {
 detect_nginx() { NGINX_BIN="$(command -v nginx 2>/dev/null || true)"; [[ -n $NGINX_BIN ]]; }
 
 ensure_nginx() {
+  if use_portable_php; then return 0; fi   # FrankenPHP is the web server
   step "nginx"
   if detect_nginx; then success "nginx found: $NGINX_BIN"; return 0; fi
   need_root "Installing nginx" || return 1
@@ -973,11 +1137,19 @@ require_panel() {
 load_runtime() {
   detect_system
   detect_web_user
-  detect_php   || { error "PHP >= 8.4 not found. Run 'Install Panel' first."; return 1; }
-  detect_fpm   >/dev/null 2>&1
-  detect_nginx >/dev/null 2>&1
+  PHP_MODE="$(cfg_get PHP_MODE system)"
+  if use_portable_php; then
+    FRANKEN_BIN="$MP_HOME/opt/frankenphp/frankenphp"; PHP_BIN="$MP_HOME/opt/bin/php"
+    FPM_BIN=""; NGINX_BIN=""
+    [[ -x $FRANKEN_BIN && -x $PHP_BIN ]] || { error "Portable PHP is missing. Run 'Install Panel' first."; return 1; }
+  else
+    detect_php   || { error "PHP >= 8.4 not found. Run 'Install Panel' first."; return 1; }
+    detect_fpm   >/dev/null 2>&1
+    detect_nginx >/dev/null 2>&1
+  fi
   NODE_BIN="$(command -v node 2>/dev/null || true)"
   COMPOSER_BIN="$(command -v composer 2>/dev/null || true)"
+  [[ -z $COMPOSER_BIN && -x "$BIN_DIR/composer" ]] && COMPOSER_BIN="$BIN_DIR/composer"
   detect_db_bins >/dev/null 2>&1
   PANEL_PORT="$(cfg_get PANEL_PORT "$(default_panel_port)")"
   return 0
@@ -1077,7 +1249,7 @@ test_db_connection() {  # host port db user pass
 setup_env() {  # expects: W_URL W_TZ W_EMAIL DB_HOST DB_PORT DB_NAME DB_USER DB_PASS USE_REDIS
   local f="$PANEL_DIR/.env"
   [[ -f $f ]] || cp "$PANEL_DIR/.env.example" "$f" || { error "Missing .env.example in the panel repo."; return 1; }
-  [[ -n "$(env_get APP_KEY)" ]]      || env_set APP_KEY "base64:$(openssl rand -base64 32)"
+  [[ -n "$(env_get APP_KEY)" ]]      || env_set APP_KEY "base64:$(rand_key)"
   [[ -n "$(env_get HASHIDS_SALT)" ]] || env_set HASHIDS_SALT "$(rand_alnum 20)"
   env_set APP_URL "$W_URL"
   local tzv; tzv="$(normalize_timezone "$W_TZ")" || tzv=""
@@ -1097,10 +1269,9 @@ setup_env() {  # expects: W_URL W_TZ W_EMAIL DB_HOST DB_PORT DB_NAME DB_USER DB_
   else
     env_set CACHE_DRIVER "file"; env_set SESSION_DRIVER "file"; env_set QUEUE_CONNECTION "database"
   fi
-  if [[ $W_URL == https://* ]]; then
-    env_set SESSION_SECURE_COOKIE "true"
-    env_set TRUSTED_PROXIES "*"
-  fi
+  if [[ $W_URL == https://* ]]; then env_set SESSION_SECURE_COOKIE "true"; fi
+  # HTTPS is terminated by a proxy (Cloudflare, Codespaces/CodeSandbox port forwarding, ...)
+  if [[ $W_URL == https://* ]] || behind_platform_proxy; then env_set TRUSTED_PROXIES "*"; fi
   fix_perms
   success ".env written ($f)"
 }
@@ -1239,21 +1410,61 @@ nginx_test() {
 # ----------------------------------------------------------------------------
 # Service definitions for both run modes
 # ----------------------------------------------------------------------------
+write_caddyfile() {  # write_caddyfile <port>   (portable mode: FrankenPHP is the web server)
+  local port="$1"
+  mkdir -p "$MP_HOME/frankenphp"
+  cat > "$MP_HOME/frankenphp/Caddyfile" <<CADDY_EOF
+# Generated by monopanel.sh
+{
+    frankenphp
+    order php_server before file_server
+    auto_https off
+    admin off
+}
+
+:${port} {
+    root * ${PANEL_DIR}/public
+    encode zstd gzip
+    php_server
+}
+CADDY_EOF
+}
+
+# Service names that make up the web front-end for a run mode.
+web_service_names() {  # web_service_names production|development
+  if use_portable_php; then echo "web"
+  elif [[ $1 == production ]]; then echo "php-fpm nginx"
+  else echo "serve"; fi
+}
+
 define_panel_services() {  # define_panel_services production|development
   local mode="$1"
   svc_define queue "$PANEL_DIR" "$WEB_USER" "" "MonoPanel queue worker" \
     env HOME="$WEB_HOME" "$PHP_BIN" artisan queue:work --queue=high,standard,low --sleep=3 --tries=3
-  svc_define scheduler "$PANEL_DIR" "$WEB_USER" "" "MonoPanel scheduler" \
-    env HOME="$WEB_HOME" "$PHP_BIN" artisan schedule:work
-  if [[ $mode == production ]]; then
-    write_web_configs
-    svc_define php-fpm "$PANEL_DIR" "" "" "MonoPanel PHP-FPM" \
-      "$FPM_BIN" --nodaemonize --fpm-config "$MP_HOME/php-fpm/php-fpm.conf"
-    svc_define nginx "$PANEL_DIR" "" "" "MonoPanel nginx" \
-      "$NGINX_BIN" -c "$MP_HOME/nginx/nginx.conf" -g "daemon off;"
+
+  if use_portable_php; then
+    write_caddyfile "${RUN_PORT:-$PANEL_PORT}"
+    svc_define web "$PANEL_DIR" "" "" "MonoPanel web (FrankenPHP)" \
+      "$FRANKEN_BIN" run --config "$MP_HOME/frankenphp/Caddyfile" --adapter caddyfile
+    # schedule:work would re-launch PHP through PHP_BINARY (the FrankenPHP file) - use a plain loop instead
+    svc_define scheduler "$PANEL_DIR" "$WEB_USER" "" "MonoPanel scheduler" \
+      bash -c 'while true; do "$0" artisan schedule:run >/dev/null 2>&1; sleep 60; done' "$PHP_BIN"
   else
-    svc_define serve "$PANEL_DIR" "$WEB_USER" "" "MonoPanel dev server (artisan serve)" \
-      env HOME="$WEB_HOME" PHP_CLI_SERVER_WORKERS=4 "$PHP_BIN" artisan serve --host=0.0.0.0 --port="${RUN_PORT:-$PANEL_PORT}"
+    svc_define scheduler "$PANEL_DIR" "$WEB_USER" "" "MonoPanel scheduler" \
+      env HOME="$WEB_HOME" "$PHP_BIN" artisan schedule:work
+    if [[ $mode == production ]]; then
+      write_web_configs
+      svc_define php-fpm "$PANEL_DIR" "" "" "MonoPanel PHP-FPM" \
+        "$FPM_BIN" --nodaemonize --fpm-config "$MP_HOME/php-fpm/php-fpm.conf"
+      svc_define nginx "$PANEL_DIR" "" "" "MonoPanel nginx" \
+        "$NGINX_BIN" -c "$MP_HOME/nginx/nginx.conf" -g "daemon off;"
+    else
+      svc_define serve "$PANEL_DIR" "$WEB_USER" "" "MonoPanel dev server (artisan serve)" \
+        env HOME="$WEB_HOME" PHP_CLI_SERVER_WORKERS=4 "$PHP_BIN" artisan serve --host=0.0.0.0 --port="${RUN_PORT:-$PANEL_PORT}"
+    fi
+  fi
+
+  if [[ $mode == development ]]; then
     svc_define vite "$PANEL_DIR" "$WEB_USER" "" "MonoPanel Vite dev server" \
       env HOME="$WEB_HOME" "$NODE_BIN" node_modules/vite/bin/vite.js --host 0.0.0.0 --port "$VITE_PORT" --strictPort
   fi
@@ -1330,16 +1541,233 @@ create_admin() {
 }
 
 # ----------------------------------------------------------------------------
-# 1) Install Panel
+# Strategy: system packages (root) or portable user-space tools (anywhere)
+# ----------------------------------------------------------------------------
+decide_strategy() {
+  local m; m="$(cfg_get PHP_MODE "")"
+  if [[ -n ${MP_PORTABLE:-} || -z $m ]]; then
+    if [[ ${MP_PORTABLE:-0} == 1 ]]; then m="portable"
+    elif (( CAN_INSTALL )); then m="system"
+    elif detect_php && detect_fpm && detect_nginx && [[ -z "$(missing_php_exts)" ]]; then m="system"
+    else m="portable"; fi
+  fi
+  PHP_MODE="$m"; cfg_set PHP_MODE "$m"
+}
+
+privilege_label() {
+  if (( IS_ROOT )); then echo "root"; else echo "no root (portable mode)"; fi
+}
+
+# ----------------------------------------------------------------------------
+# External database helpers (needed whenever local MariaDB cannot be installed)
+# ----------------------------------------------------------------------------
+parse_db_url() {  # mysql://user:pass@host:3306/dbname  -> DB_USER DB_PASS DB_HOST DB_PORT DB_NAME
+  local u="$1" re='^(mysql|mariadb)://([^:@/]+):([^@]*)@([^:/]+)(:([0-9]+))?/([^?]+)'
+  [[ $u =~ $re ]] || return 1
+  DB_USER="${BASH_REMATCH[2]}"
+  DB_PASS="${BASH_REMATCH[3]}"; DB_PASS="$(printf '%b' "${DB_PASS//%/\\x}")"   # percent-decoding
+  DB_HOST="${BASH_REMATCH[4]}"; DB_PORT="${BASH_REMATCH[6]:-3306}"; DB_NAME="${BASH_REMATCH[7]}"
+  return 0
+}
+
+collect_external_db() {
+  DB_MODE_SEL="external"
+  if [[ -n ${MP_DB_URL:-} ]]; then
+    parse_db_url "$MP_DB_URL" || { error "MP_DB_URL must look like mysql://user:pass@host:3306/dbname"; return 1; }
+  elif [[ -n ${MP_DB_HOST:-} ]]; then
+    DB_HOST="$MP_DB_HOST"; DB_PORT="${MP_DB_PORT:-3306}"; DB_NAME="${MP_DB_NAME:-panel}"
+    DB_USER="${MP_DB_USER:-monopanel}"; DB_PASS="${MP_DB_PASS:-}"
+  else
+    note "This machine cannot host its own database, so MonoPanel needs a MySQL/MariaDB server."
+    note "Hosting panels have a 'Databases' tab; free options also exist (Aiven, TiDB Cloud, Clever Cloud…)."
+    local u; u="$(ask "Paste the DB URL  mysql://user:pass@host:3306/dbname  (Enter = type fields)" "")"
+    if [[ -n $u ]]; then
+      parse_db_url "$u" || { error "That is not a valid mysql:// URL."; return 1; }
+    else
+      DB_HOST="$(ask "DB host" "")"; DB_PORT="$(ask "DB port" "3306")"
+      DB_NAME="$(ask "DB name" "panel")"; DB_USER="$(ask "DB user (not root)" "")"
+      DB_PASS="$(ask_secret "DB password")"
+    fi
+  fi
+  if [[ -z ${DB_HOST:-} || -z ${DB_USER:-} || -z ${DB_NAME:-} ]]; then
+    error "Database details are missing. Non-interactive? Set MP_DB_URL=mysql://user:pass@host:3306/dbname"
+    return 1
+  fi
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# The install pipeline (shared by Quick Setup and the custom wizard)
+# expects: PANEL_PORT W_URL W_TZ W_EMAIL DB_MODE_SEL DB_HOST DB_PORT DB_NAME DB_USER DB_PASS USE_REDIS
+# ----------------------------------------------------------------------------
+install_execute() {
+  cfg_set PANEL_DIR "$PANEL_DIR"; cfg_set PANEL_REPO "$PANEL_REPO"; cfg_set PANEL_BRANCH "$PANEL_BRANCH"
+  cfg_set PANEL_PORT "$PANEL_PORT"; cfg_set DB_MODE "$DB_MODE_SEL"; cfg_set USE_REDIS "$USE_REDIS"
+  decide_strategy
+  if use_portable_php; then info "Runtime: portable (FrankenPHP + Node tarball) — works without root"
+  else info "Runtime: system packages (PHP-FPM + nginx)"; fi
+  line
+
+  ensure_base_deps || return 1
+  install_php      || return 1
+  ensure_composer  || return 1
+  install_node     || return 1
+  ensure_nginx     || return 1
+  if [[ $DB_MODE_SEL == local ]]; then install_db_server || return 1; fi
+  if [[ $USE_REDIS == yes ]]; then
+    install_redis || { warn "Redis unavailable — using file/database drivers instead."; USE_REDIS="no"; cfg_set USE_REDIS no; }
+  fi
+  detect_web_user
+
+  clone_panel || return 1
+
+  if [[ $DB_MODE_SEL == local ]]; then
+    local old_pw; old_pw="$(env_get DB_PASSWORD "")"
+    if [[ -n $old_pw && $old_pw != null ]]; then DB_PASS="$old_pw"; else DB_PASS="$(rand_alnum 24)"; fi
+    DB_HOST="127.0.0.1"; DB_PORT="3306"; DB_NAME="monopanel"; DB_USER="monopanel"
+    ensure_db_running || return 1
+    setup_local_db "$DB_NAME" "$DB_USER" "$DB_PASS" || return 1
+  else
+    info "Testing the database connection"
+    if ! test_db_connection "$DB_HOST" "$DB_PORT" "$DB_NAME" "$DB_USER" "$DB_PASS" 2>>"$INSTALL_LOG"; then
+      error "Could not connect to $DB_USER@$DB_HOST:$DB_PORT/$DB_NAME — check the details (and that this machine may reach the DB)."
+      tail -n 2 "$INSTALL_LOG" | sed 's/^/    /'
+      return 1
+    fi
+    success "Database connection OK."
+  fi
+
+  setup_env || return 1
+
+  step "Installing PHP dependencies (composer)"
+  local -a cargs=(install --no-dev --optimize-autoloader --no-interaction)
+  use_portable_php && cargs+=(--no-scripts)
+  run_live "composer install" composer_run "${cargs[@]}" || return 1
+  if use_portable_php; then artisan package:discover --ansi >>"$INSTALL_LOG" 2>&1 || warn "package:discover reported a problem (see $INSTALL_LOG)"; fi
+  build_assets || return 1
+  fix_perms
+
+  [[ $USE_REDIS == yes ]] && { ensure_redis_running || warn "Redis is not running yet; it starts with Run Panel."; }
+  step "Preparing the database (migrate + seed)"
+  artisan migrate --seed --force --no-interaction 2>&1 | tee -a "$INSTALL_LOG"
+  if (( PIPESTATUS[0] != 0 )); then error "Migration failed — see the output above."; return 1; fi
+  artisan storage:link --no-interaction >>"$INSTALL_LOG" 2>&1 || true
+  fix_perms
+
+  step "Writing service definitions"
+  define_panel_services production
+  cfg_set INSTALLED yes
+  cfg_set RUN_MODE production
+  return 0
+}
+
+# ----------------------------------------------------------------------------
+# Auto-detected defaults
+# ----------------------------------------------------------------------------
+auto_port() {
+  if [[ -n ${MP_PORT:-} ]]; then printf '%s' "$MP_PORT"; return; fi
+  if [[ ${MP_PLATFORM:-vps} == pterodactyl && -n ${SERVER_PORT:-} ]]; then printf '%s' "$SERVER_PORT"; return; fi
+  if [[ -n ${PANEL_PORT:-} ]]; then printf '%s' "$PANEL_PORT"; return; fi
+  case "${MP_PLATFORM:-vps}" in
+    vps|container) if (( IS_ROOT )) && ! port_in_use 80; then printf '80'; else first_free_port 8080 8081 8082 8090; fi ;;
+    *)             first_free_port 8080 8081 8082 8090 8000 ;;
+  esac
+}
+
+auto_url() {  # auto_url <port>
+  local port="$1" u ip
+  if [[ -n ${MP_URL:-} ]]; then printf '%s' "${MP_URL%/}"; return; fi
+  u="$(platform_url "$port")"
+  if [[ -n $u ]]; then printf '%s' "$u"; return; fi
+  if behind_platform_proxy; then printf 'http://localhost:%s' "$port"; return; fi
+  ip="$(public_ip)"
+  if [[ $port == 80 ]]; then printf 'http://%s' "$ip"; else printf 'http://%s:%s' "$ip" "$port"; fi
+}
+
+print_ready_summary() {  # print_ready_summary <admin user> <admin password>
+  local user="$1" pass="$2" url port cmd
+  url="$(env_get APP_URL)"; port="$(cfg_get PANEL_PORT "")"
+  if [[ -x "$BIN_DIR/monopanel" ]]; then
+    if [[ ":$PATH:" == *":$BIN_DIR:"* ]]; then cmd="monopanel"; else cmd="$BIN_DIR/monopanel"; fi
+  else cmd="bash monopanel.sh"; fi
+  line
+  printf "${BOLD_GREEN}  MonoPanel is ready${RESET}\n"
+  line
+  printf "  ${BOLD}Open     ${RESET} %s\n" "$url"
+  if [[ -n $pass ]]; then
+    printf "  ${BOLD}Login    ${RESET} %s  /  %s\n" "$user" "$pass"
+    note "  (also saved in $MP_HOME/credentials.txt — change the password after logging in)"
+  fi
+  printf "  ${BOLD}Manage   ${RESET} run ${BOLD_CYAN}%s${RESET} anytime for the menu  ·  %s status | logs | update\n" "$cmd" "$cmd"
+  case "${MP_PLATFORM:-vps}" in
+    codespaces)  note "Codespaces: open the PORTS tab and click the globe next to port ${port}. Others need it set to Public (right-click → Port Visibility)." ;;
+    gitpod)      note "Gitpod: open the port from the Ports view (set it to public if others need access)." ;;
+    codesandbox) note "CodeSandbox: open port ${port} from the Ports panel. If the URL above is wrong, use  ${cmd} → Tools → Change the panel URL." ;;
+    pterodactyl) note "Hosted container: the panel listens on your server's allocated port (${port})." ;;
+    *)           note "Reach it at the URL above, or add a Cloudflare Tunnel with  ${cmd} → Connect Cloudflared  (target http://localhost:${port})." ;;
+  esac
+  line
+}
+
+# ----------------------------------------------------------------------------
+# ⚡ Quick Setup — everything automatic
+# ----------------------------------------------------------------------------
+auto_setup() {
+  banner
+  step "⚡ Quick Setup — automatic install, nothing to answer"
+  detect_system
+  info "Platform : $(platform_label) · $(privilege_label) · init: $(init_label)"
+  info "Machine  : $OS_PRETTY ($ARCH_RAW) · RAM $(mem_limit_mb) MB · disk free $(disk_free_mb "$HOME") MB"
+  line
+
+  if panel_installed; then
+    success "MonoPanel is already installed in $PANEL_DIR — starting it."
+    load_runtime || return 1
+    run_panel "$(cfg_get RUN_MODE production)" nobanner
+    return $?
+  fi
+
+  PANEL_PORT="$(auto_port)"
+  if (( ! IS_ROOT )) && (( PANEL_PORT < 1024 )); then PANEL_PORT="$(first_free_port 8080 8081 8082 8090)"; fi
+  W_URL="$(auto_url "$PANEL_PORT")"
+  local tz; tz="$(normalize_timezone "${MP_TZ:-$(detect_timezone)}")" || tz=""
+  W_TZ="${tz:-UTC}"
+  W_EMAIL="${MP_ADMIN_EMAIL:-admin@monopanel.local}"
+  local a_user="${MP_ADMIN_USER:-admin}" a_pass="${MP_ADMIN_PASSWORD:-$(rand_alnum 16)}"
+
+  if local_db_possible; then DB_MODE_SEL="local"; DB_HOST="127.0.0.1"; DB_PORT="3306"; DB_NAME="monopanel"; DB_USER="monopanel"; DB_PASS=""
+  else collect_external_db || return 1; fi
+  USE_REDIS="no"
+  if (( CAN_INSTALL )) && [[ ${MP_PORTABLE:-0} != 1 ]]; then USE_REDIS="yes"; fi
+
+  info "Port ${PANEL_PORT} · URL ${W_URL} · timezone ${W_TZ} · database ${DB_MODE_SEL} · redis ${USE_REDIS}"
+  line
+  install_execute || { error "Quick Setup stopped — the messages above say why. Log: $INSTALL_LOG"; press_enter; return 1; }
+
+  step "Creating the administrator account"
+  if artisan p:user:make --email="$W_EMAIL" --username="$a_user" --password="$a_pass" --admin=1 --no-interaction >>"$INSTALL_LOG" 2>&1; then
+    success "Admin '$a_user' created."
+    umask 077; printf 'URL: %s\nUser: %s\nEmail: %s\nPassword: %s\n' "$W_URL" "$a_user" "$W_EMAIL" "$a_pass" > "$MP_HOME/credentials.txt"; umask 022
+  else
+    warn "Could not create the admin automatically (see $INSTALL_LOG). Use Tools → Create an admin user."
+    a_pass=""
+  fi
+
+  RUN_PORT="$PANEL_PORT"
+  run_panel production nobanner
+  print_ready_summary "$a_user" "$a_pass"
+}
+
+# ----------------------------------------------------------------------------
+# 2) Install Panel (custom wizard)
 # ----------------------------------------------------------------------------
 install_panel() {
   banner
-  step "MonoPanel — full installation"
+  step "MonoPanel — custom installation"
   detect_system
-  info "System : $OS_PRETTY ($ARCH_RAW) · package manager: $PKG"
-  info "Init   : $(init_label)$( (( IN_CONTAINER )) && echo ' · running inside a container')"
-  info "Memory : $(mem_limit_mb) MB · panel dir: $PANEL_DIR"
-  (( IS_ROOT )) || warn "Not running as root — package installs will fail unless everything is already present."
+  info "Platform : $(platform_label) · $(privilege_label) · init: $(init_label)"
+  info "Machine  : $OS_PRETTY ($ARCH_RAW) · package manager: $PKG · RAM $(mem_limit_mb) MB"
+  info "Panel dir: $PANEL_DIR"
   line
 
   if panel_installed; then
@@ -1348,23 +1776,23 @@ install_panel() {
     confirm "Continue anyway?" n || { press_enter; return 0; }
   fi
 
-  # ---- wizard ----
-  local def_port def_url def_tz def_email
-  def_port="$(default_panel_port)"
+  local def_port def_url
+  def_port="$(auto_port)"
   PANEL_PORT="$(ask "Panel HTTP port" "$def_port")"
   [[ $PANEL_PORT =~ ^[0-9]+$ ]] || { error "Port must be a number."; press_enter; return 1; }
-  if port_in_use "$PANEL_PORT" && ! svc_running nginx; then
+  if (( ! IS_ROOT )) && (( PANEL_PORT < 1024 )); then
+    warn "Without root the port must be 1024 or higher — using 8080."; PANEL_PORT=8080
+  fi
+  if port_in_use "$PANEL_PORT" && ! svc_running nginx && ! svc_running web; then
     warn "Port $PANEL_PORT is already in use by another program."
     confirm "Use it anyway?" n || { press_enter; return 1; }
   fi
-  local ipshow; ipshow="$(public_ip)"
-  if [[ -f "$PANEL_DIR/.env" ]]; then def_url="$(env_get APP_URL "")"; fi
-  if [[ -z ${def_url:-} ]]; then
-    if [[ $PANEL_PORT == 80 ]]; then def_url="http://${ipshow}"; else def_url="http://${ipshow}:${PANEL_PORT}"; fi
-  fi
+  def_url="$(env_get APP_URL "")"
+  [[ -n $def_url ]] || def_url="$(auto_url "$PANEL_PORT")"
   W_URL="$(ask "Panel URL (what users type in the browser)" "$def_url")"
   W_URL="${W_URL%/}"
   [[ $W_URL =~ ^https?:// ]] || { error "The URL must start with http:// or https://"; press_enter; return 1; }
+
   local tz_def tz_try tz_ok="" n
   tz_def="$(env_get APP_TIMEZONE "$(detect_timezone)")"
   for n in 1 2 3; do
@@ -1373,79 +1801,27 @@ install_panel() {
     tz_ok=""
     warn "'$tz_try' is not a valid timezone — an invalid value would break the panel. Use the Region/City form."
   done
-  if [[ -z $tz_ok ]]; then warn "Falling back to UTC (change APP_TIMEZONE in the panel settings later)."; tz_ok="UTC"; fi
+  if [[ -z $tz_ok ]]; then warn "Falling back to UTC (change APP_TIMEZONE later)."; tz_ok="UTC"; fi
   W_TZ="$tz_ok"
-  def_email="$(env_get APP_SERVICE_AUTHOR "")"
-  W_EMAIL="$(ask "Admin / egg-author email" "${def_email:-admin@example.com}")"
+  W_EMAIL="$(ask "Admin / egg-author email" "$(env_get APP_SERVICE_AUTHOR "admin@example.com")")"
 
-  local dbmode dbchoice
-  dbmode="$(cfg_get DB_MODE local)"
-  dbchoice="$(ask "Database: 1) install local MariaDB   2) use an existing MySQL/MariaDB server" "$([[ $dbmode == local ]] && echo 1 || echo 2)")"
-  if [[ $dbchoice == 2 ]]; then
-    dbmode="external"
-    DB_HOST="$(ask "DB host" "127.0.0.1")"; DB_PORT="$(ask "DB port" "3306")"
-    DB_NAME="$(ask "DB name" "panel")";    DB_USER="$(ask "DB user (not root)" "monopanel")"
-    DB_PASS="$(ask_secret "DB password")"
+  if local_db_possible; then
+    local dbchoice
+    dbchoice="$(ask "Database: 1) install local MariaDB   2) use an existing MySQL/MariaDB server" "$([[ "$(cfg_get DB_MODE local)" == local ]] && echo 1 || echo 2)")"
+    if [[ $dbchoice == 2 ]]; then collect_external_db || { press_enter; return 1; }
+    else DB_MODE_SEL="local"; DB_HOST="127.0.0.1"; DB_PORT="3306"; DB_NAME="monopanel"; DB_USER="monopanel"; DB_PASS=""; fi
   else
-    dbmode="local"; DB_HOST="127.0.0.1"; DB_PORT="3306"; DB_NAME="monopanel"; DB_USER="monopanel"; DB_PASS=""
+    collect_external_db || { press_enter; return 1; }
   fi
   USE_REDIS="no"
-  confirm "Use Redis for cache/queue/sessions? (recommended)" y && USE_REDIS="yes"
+  if (( CAN_INSTALL )) && [[ ${MP_PORTABLE:-0} != 1 ]] && confirm "Use Redis for cache/queue/sessions? (recommended)" y; then USE_REDIS="yes"; fi
 
-  cfg_set PANEL_DIR "$PANEL_DIR"; cfg_set PANEL_REPO "$PANEL_REPO"; cfg_set PANEL_BRANCH "$PANEL_BRANCH"
-  cfg_set PANEL_PORT "$PANEL_PORT"; cfg_set DB_MODE "$dbmode"; cfg_set USE_REDIS "$USE_REDIS"
-  line
-
-  # ---- dependencies ----
-  ensure_base_deps || { press_enter; return 1; }
-  install_php      || { press_enter; return 1; }
-  ensure_composer  || { press_enter; return 1; }
-  install_node     || { press_enter; return 1; }
-  ensure_nginx     || { press_enter; return 1; }
-  if [[ $dbmode == local ]]; then install_db_server || { press_enter; return 1; }; fi
-  if [[ $USE_REDIS == yes ]]; then install_redis || { warn "Redis unavailable — falling back to file/database drivers."; USE_REDIS="no"; cfg_set USE_REDIS no; }; fi
-  detect_web_user
-
-  # ---- source ----
-  clone_panel || { press_enter; return 1; }
-
-  # ---- database ----
-  if [[ $dbmode == local ]]; then
-    local old_pw; old_pw="$(env_get DB_PASSWORD "")"
-    if [[ -n $old_pw && $old_pw != null ]]; then DB_PASS="$old_pw"; else DB_PASS="$(rand_alnum 24)"; fi
-    ensure_db_running || { press_enter; return 1; }
-    setup_local_db "$DB_NAME" "$DB_USER" "$DB_PASS" || { press_enter; return 1; }
-  else
-    info "Testing the database connection"
-    if ! test_db_connection "$DB_HOST" "$DB_PORT" "$DB_NAME" "$DB_USER" "$DB_PASS"; then
-      error "Could not connect with those credentials."; press_enter; return 1
-    fi
-    success "Database connection OK."
-  fi
-
-  # ---- configuration + dependencies of the app ----
-  setup_env || { press_enter; return 1; }
-  step "Installing PHP dependencies (composer)"
-  run_live "composer install" composer_run install --no-dev --optimize-autoloader --no-interaction || { press_enter; return 1; }
-  build_assets || { press_enter; return 1; }
-  fix_perms
-
-  [[ $USE_REDIS == yes ]] && { ensure_redis_running || warn "Redis is not running yet; start it via Run Panel."; }
-  step "Preparing the database (migrate + seed)"
-  artisan migrate --seed --force --no-interaction 2>&1 | tee -a "$INSTALL_LOG"
-  if (( PIPESTATUS[0] != 0 )); then error "Migration failed — see the output above."; press_enter; return 1; fi
-  artisan storage:link --no-interaction >>"$INSTALL_LOG" 2>&1 || true
-  fix_perms
-
-  step "Writing service definitions"
-  define_panel_services production
-  cfg_set INSTALLED yes
-  cfg_set RUN_MODE production
+  install_execute || { press_enter; return 1; }
 
   line
   success "MonoPanel is installed."
   if confirm "Create the first administrator account now?" y; then create_admin; fi
-  if confirm "Start the panel in production mode now?" y; then run_panel production; return; fi
+  if confirm "Start the panel in production mode now?" y; then RUN_PORT="$PANEL_PORT"; run_panel production; return; fi
   press_enter
 }
 
@@ -1471,7 +1847,7 @@ apply_vite_public_url() {  # rewrite public/hot so a browser OUTSIDE this machin
 
 stop_panel_procs() {
   local s
-  for s in nginx php-fpm serve vite queue scheduler; do
+  for s in nginx php-fpm serve web vite queue scheduler; do
     if svc_defined "$s" && svc_running "$s"; then svc_stop "$s"; fi
   done
 }
@@ -1487,7 +1863,7 @@ run_panel() {  # run_panel production|development [nobanner]
   require_panel || { press_enter; return 1; }
   load_runtime  || { press_enter; return 1; }
 
-  if [[ $mode == production ]]; then
+  if [[ $mode == production ]] && ! use_portable_php; then
     [[ -n ${FPM_BIN:-} && -n ${NGINX_BIN:-} ]] || { error "nginx/php-fpm missing. Run 'Install Panel' again."; press_enter; return 1; }
   else
     [[ -n ${NODE_BIN:-} ]] || { error "Node.js missing. Run 'Install Panel' again."; press_enter; return 1; }
@@ -1509,9 +1885,9 @@ run_panel() {  # run_panel production|development [nobanner]
     fi
     fix_perms
     define_panel_services production
-    nginx_test || { press_enter; return 1; }
+    if ! use_portable_php; then nginx_test || { press_enter; return 1; }; fi
     artisan optimize:clear --no-interaction >>"$INSTALL_LOG" 2>&1
-    for s in php-fpm nginx queue scheduler; do
+    for s in $(web_service_names production) queue scheduler; do
       if svc_start "$s"; then success "$s started"; else error "$s failed to start — see $LOG_DIR/$s.log"; tail -n 8 "$LOG_DIR/$s.log" 2>/dev/null | sed 's/^/    /'; fi
     done
   else
@@ -1534,7 +1910,7 @@ run_panel() {  # run_panel production|development [nobanner]
     fix_perms
     define_panel_services development
     artisan optimize:clear --no-interaction >>"$INSTALL_LOG" 2>&1
-    for s in serve vite queue scheduler; do
+    for s in $(web_service_names development) vite queue scheduler; do
       if svc_start "$s"; then success "$s started"; else error "$s failed to start — see $LOG_DIR/$s.log"; tail -n 8 "$LOG_DIR/$s.log" 2>/dev/null | sed 's/^/    /'; fi
     done
     local vurl="${MP_VITE_PUBLIC_URL:-}"
@@ -1563,7 +1939,7 @@ run_panel() {  # run_panel production|development [nobanner]
 stop_panel() {
   banner; step "Stopping MonoPanel"
   local s any=0
-  for s in nginx php-fpm serve vite queue scheduler; do
+  for s in nginx php-fpm serve web vite queue scheduler; do
     if svc_defined "$s" && svc_running "$s"; then svc_stop "$s"; success "$s stopped"; any=1; fi
   done
   (( any )) || info "No panel processes were running."
@@ -1574,7 +1950,7 @@ stop_panel() {
 stop_everything() {
   banner; step "Stopping everything MonoPanel started"
   local s
-  for s in nginx php-fpm serve vite queue scheduler wings cloudflared cloudflared-quick redis mariadb docker; do
+  for s in nginx php-fpm serve web vite queue scheduler wings cloudflared cloudflared-quick redis mariadb docker; do
     if svc_defined "$s" && svc_running "$s"; then svc_stop "$s"; success "$s stopped"; fi
   done
   press_enter
@@ -1621,7 +1997,7 @@ update_panel() {
 
   local mode was_running=0 before after
   mode="$(cfg_get RUN_MODE production)"
-  { svc_running nginx || svc_running serve; } && was_running=1
+  { svc_running nginx || svc_running serve || svc_running web; } && was_running=1
   before="$(mp_git -C "$PANEL_DIR" rev-parse --short HEAD 2>/dev/null)"
 
   if confirm "Back up the database and .env first?" y; then
@@ -1658,8 +2034,11 @@ update_panel() {
 
   fix_perms
   step "PHP dependencies"
-  run_live "composer install" composer_run install --no-dev --optimize-autoloader --no-interaction \
+  local -a cargs=(install --no-dev --optimize-autoloader --no-interaction)
+  use_portable_php && cargs+=(--no-scripts)
+  run_live "composer install" composer_run "${cargs[@]}" \
     || { error "composer failed"; (( was_running )) && artisan up >/dev/null 2>&1; press_enter; return 1; }
+  if use_portable_php; then artisan package:discover --ansi >>"$INSTALL_LOG" 2>&1; fi
   build_assets || { (( was_running )) && artisan up >/dev/null 2>&1; press_enter; return 1; }
   fix_perms
 
@@ -1686,9 +2065,10 @@ update_panel() {
 show_status() {
   banner; step "Status"
   detect_system
-  detect_php >/dev/null 2>&1
+  if use_portable_php; then PHP_BIN="$MP_HOME/opt/bin/php"; else detect_php >/dev/null 2>&1; fi
   local mode; mode="$(cfg_get RUN_MODE -)"
   printf "${BOLD}System${RESET}   %s (%s) · %s · RAM limit %s MB\n" "$OS_PRETTY" "$ARCH_RAW" "$(init_label)" "$(mem_limit_mb)"
+  printf "${BOLD}Platform${RESET} %s · %s · PHP runtime: %s\n" "$(platform_label)" "$(privilege_label)" "${PHP_MODE:-not decided yet}"
   if panel_installed; then
     printf "${BOLD}Panel${RESET}    %s · branch %s · commit %s · mode %s\n" "$PANEL_DIR" "$PANEL_BRANCH" \
       "$(mp_git -C "$PANEL_DIR" rev-parse --short HEAD 2>/dev/null || echo '?')" "$mode"
@@ -1705,7 +2085,7 @@ show_status() {
   detect_db_bins >/dev/null 2>&1
   printf "  %-16s %s\n" "database" "$(if [[ "$(cfg_get DB_MODE local)" != local ]]; then echo 'external'; elif db_ping; then printf "${BOLD_GREEN}up${RESET}"; else printf "${BOLD_RED}down${RESET}"; fi)"
   printf "  %-16s %s\n" "redis" "$(if [[ "$(cfg_get USE_REDIS yes)" != yes ]]; then echo 'not used'; elif redis_ping; then printf "${BOLD_GREEN}up${RESET}"; else printf "${BOLD_RED}down${RESET}"; fi)"
-  for s in nginx php-fpm serve vite queue scheduler; do
+  for s in nginx php-fpm serve web vite queue scheduler; do
     svc_defined "$s" && printf "  %-16s %b\n" "$s" "$(svc_state "$s")"
   done
   printf "  %-16s %s\n" "docker" "$(if command -v docker >/dev/null 2>&1; then if docker_ok; then printf "${BOLD_GREEN}running${RESET}"; else printf "${BOLD_RED}stopped${RESET}"; fi; else printf "${GRAY}not installed${RESET}"; fi)"
@@ -1726,7 +2106,7 @@ view_logs() {
   local lv f i=0
   lv="$(ls -t "$PANEL_DIR"/storage/logs/*.log 2>/dev/null | head -n1)"
   if [[ -n $lv ]]; then labels+=("Panel (Laravel)"); paths+=("$lv"); fi
-  for f in nginx-error php-fpm serve vite queue scheduler mariadb redis docker wings cloudflared cloudflared-quick install services; do
+  for f in nginx-error php-fpm serve web vite queue scheduler mariadb redis docker wings cloudflared cloudflared-quick install services; do
     [[ -f "$LOG_DIR/$f.log" ]] && { labels+=("$f"); paths+=("$LOG_DIR/$f.log"); }
   done
   if (( ${#labels[@]} == 0 )); then warn "No logs yet."; press_enter; return 0; fi
@@ -2199,7 +2579,7 @@ apply_public_url() {  # apply_public_url https://panel.example.com
   fi
   fix_perms
   artisan config:clear --no-interaction >>"$INSTALL_LOG" 2>&1
-  for s in php-fpm queue serve; do
+  for s in php-fpm web queue serve; do
     if svc_defined "$s" && svc_running "$s"; then svc_restart "$s" >/dev/null 2>&1; fi
   done
   success "APP_URL is now $url"
@@ -2438,39 +2818,45 @@ main_menu() {
   while true; do
     banner
     local p=0 n=0 t=0 mode
-    { svc_running nginx || svc_running serve; } && p=1
+    { svc_running nginx || svc_running serve || svc_running web; } && p=1
     svc_defined wings && svc_running wings && n=1
     { svc_defined cloudflared && svc_running cloudflared; } || { svc_defined cloudflared-quick && svc_running cloudflared-quick; } && t=1
     mode="$(cfg_get RUN_MODE -)"
-    printf "  %b   %b   %b   ${GRAY}mode: %s · %s${RESET}\n" "$(menu_badge panel "$p")" "$(menu_badge node "$n")" "$(menu_badge tunnel "$t")" "$mode" "$(if use_systemd; then echo systemd; else echo built-in supervisor; fi)"
+    printf "  %b   %b   %b   ${GRAY}mode: %s${RESET}\n" "$(menu_badge panel "$p")" "$(menu_badge node "$n")" "$(menu_badge tunnel "$t")" "$mode"
+    printf "  ${GRAY}%s · %s · %s${RESET}\n" "$(platform_label)" "$(privilege_label)" "$(init_label)"
     printf "  ${GRAY}%s  ·  branch %s${RESET}\n\n" "$PANEL_DIR" "$PANEL_BRANCH"
+    if ! panel_installed; then
+      printf "  ${BOLD_GREEN}New here? Choose 1 — it installs and starts everything by itself.${RESET}\n\n"
+    fi
 
-    printf "  ${BOLD_GREEN} 1)${RESET} %-26s ${GRAY}%s${RESET}\n" "Install Panel" "dependencies, database, build, admin"
-    printf "  ${BOLD_GREEN} 2)${RESET} %-26s ${GRAY}%s${RESET}\n" "Run Panel (Production)" "nginx + php-fpm + queue + scheduler"
-    printf "  ${BOLD_GREEN} 3)${RESET} %-26s ${GRAY}%s${RESET}\n" "Run Panel (Development)" "artisan serve + Vite hot reload"
-    printf "  ${BOLD_YELLOW} 4)${RESET} %-26s\n" "Stop Panel"
-    printf "  ${BOLD_YELLOW} 5)${RESET} %-26s ${GRAY}%s${RESET}\n" "Update Panel" "pull, build, migrate, restart"
-    printf "  ${BOLD_MAGENTA} 6)${RESET} %-26s ${GRAY}%s${RESET}\n" "Configure Nodes" "Docker + Wings, create & configure"
-    printf "  ${BOLD_MAGENTA} 7)${RESET} %-26s\n" "Start Nodes"
-    printf "  ${BOLD_MAGENTA} 8)${RESET} %-26s\n" "Stop Nodes"
-    printf "  ${BOLD_CYAN} 9)${RESET} %-26s ${GRAY}%s${RESET}\n" "Connect Cloudflared" "tunnel token or quick tunnel"
-    printf "  ${CYAN}10)${RESET} %-26s ${GRAY}%s${RESET}\n" "Tools" "status, logs, backup, admin, script update"
+    printf "  ${BOLD_GREEN} 1)${RESET} %-26s ${GRAY}%s${RESET}\n" "Quick Setup" "install + run + admin, no questions"
+    printf "  ${BOLD_GREEN} 2)${RESET} %-26s ${GRAY}%s${RESET}\n" "Install Panel (custom)" "choose port, URL, database…"
+    printf "  ${BOLD_GREEN} 3)${RESET} %-26s ${GRAY}%s${RESET}\n" "Run Panel (Production)" "web server + queue + scheduler"
+    printf "  ${BOLD_GREEN} 4)${RESET} %-26s ${GRAY}%s${RESET}\n" "Run Panel (Development)" "dev server + Vite hot reload"
+    printf "  ${BOLD_YELLOW} 5)${RESET} %-26s\n" "Stop Panel"
+    printf "  ${BOLD_YELLOW} 6)${RESET} %-26s ${GRAY}%s${RESET}\n" "Update Panel" "pull, build, migrate, restart"
+    printf "  ${BOLD_MAGENTA} 7)${RESET} %-26s ${GRAY}%s${RESET}\n" "Configure Nodes" "Docker + Wings, create & configure"
+    printf "  ${BOLD_MAGENTA} 8)${RESET} %-26s\n" "Start Nodes"
+    printf "  ${BOLD_MAGENTA} 9)${RESET} %-26s\n" "Stop Nodes"
+    printf "  ${BOLD_CYAN}10)${RESET} %-26s ${GRAY}%s${RESET}\n" "Connect Cloudflared" "tunnel token or quick tunnel"
+    printf "  ${CYAN}11)${RESET} %-26s ${GRAY}%s${RESET}\n" "Tools" "status, logs, backup, admin, script update"
     printf "  ${BOLD_RED} 0)${RESET} Exit\n\n"
     line
-    printf "${YELLOW}Select an option [0-10]: ${RESET}"
+    printf "${YELLOW}Select an option [0-11]: ${RESET}"
     local choice; read -r choice || { echo; exit 0; }
 
     case "$choice" in
-      1)  install_panel ;;
-      2)  run_panel production ;;
-      3)  run_panel development ;;
-      4)  stop_panel ;;
-      5)  update_panel ;;
-      6)  node_menu ;;
-      7)  start_node ;;
-      8)  stop_node ;;
-      9)  cloudflared_menu ;;
-      10) tools_menu ;;
+      1)  auto_setup; press_enter ;;
+      2)  install_panel ;;
+      3)  run_panel production ;;
+      4)  run_panel development ;;
+      5)  stop_panel ;;
+      6)  update_panel ;;
+      7)  node_menu ;;
+      8)  start_node ;;
+      9)  stop_node ;;
+      10) cloudflared_menu ;;
+      11) tools_menu ;;
       0)
         banner
         printf "${BOLD_MAGENTA}Goodbye from MonoPanel Installer & Executer.${RESET}\n"
@@ -2485,26 +2871,79 @@ print_help() {
   cat <<EOF
 MonoPanel Installer & Executer v${MP_VERSION} — made by ${MP_AUTHOR}
 
-Usage: sudo bash monopanel.sh [command]
+One-liner (works on VPS, Codespaces, CodeSandbox, Gitpod, containers, hosted servers):
+  curl -fsSL https://raw.githubusercontent.com/Srccodeusr/MonoPanel-Executor/main/monopanel.sh | bash
+Fully automatic (no menu, no questions):
+  curl -fsSL https://raw.githubusercontent.com/Srccodeusr/MonoPanel-Executor/main/monopanel.sh | bash -s -- auto
 
-  (no command)   interactive menu
-  install        install the panel (dependencies, database, build)
-  run-prod       start the panel in production mode
-  run-dev        start the panel in development mode (Vite hot reload)
-  stop           stop the panel processes
-  restart        restart the panel in its last mode
-  update         pull the latest code, rebuild, migrate, restart
-  admin          create an administrator account
-  node-setup     node menu (Docker + Wings: local or remote)
-  node-start     start Wings          node-stop   stop Wings
-  node-sync      re-sync node config from the local panel
-  tunnel         Cloudflare Tunnel menu
+After the first run just type:  monopanel
+
+Commands: monopanel [command]
+  (none)        interactive menu
+  auto          Quick Setup — install, run, create admin, print the URL
+  install       custom install wizard
+  run-prod      start in production mode      run-dev   start in development mode
+  stop | restart | update | admin
+  node-setup    Docker + Wings (local or remote node)
+  node-start | node-stop | node-sync
+  tunnel        Cloudflare Tunnel menu
   status | logs | backup | self-update | help
 
-Environment: MONOPANEL_REPO, MONOPANEL_BRANCH, MONOPANEL_DIR, MONOPANEL_HOME,
-MONOPANEL_GIT_TOKEN, MONOPANEL_SCRIPT_URL, MP_INIT=systemd|builtin,
-MP_ASSUME_DEFAULTS=1, MP_BUILD_MEM, MP_VITE_PUBLIC_URL
+Automation variables (all optional):
+  MP_PORT, MP_URL, MP_TZ, MP_ADMIN_EMAIL, MP_ADMIN_USER, MP_ADMIN_PASSWORD
+  MP_DB_URL=mysql://user:pass@host:3306/db      (needed when no local database is possible)
+  MP_PORTABLE=1   force the no-root portable runtime      MP_INIT=systemd|builtin
+  MP_ASSUME_DEFAULTS=1   never prompt
+  MONOPANEL_REPO, MONOPANEL_BRANCH, MONOPANEL_DIR, MONOPANEL_HOME, MONOPANEL_GIT_TOKEN
 EOF
+}
+
+# ----------------------------------------------------------------------------
+# Start-up plumbing: piped runs, sudo, the `monopanel` shortcut
+# ----------------------------------------------------------------------------
+bootstrap_self() {  # `curl … | bash` leaves no file to re-run (sudo, self-update) → fetch ourselves once
+  [[ -n ${SELF:-} ]] && return 0
+  [[ "${MP_BOOTSTRAPPED:-0}" == 1 ]] && return 0
+  local url="${MONOPANEL_SCRIPT_URL:-$SCRIPT_URL_DEFAULT}" tmp
+  [[ -n $url ]] || return 0
+  tmp="$(mktemp "${TMPDIR:-/tmp}/monopanel.XXXXXX" 2>/dev/null)" || return 0
+  if curl -fsSL --retry 2 --connect-timeout 10 "$url" -o "$tmp" 2>/dev/null && bash -n "$tmp" 2>/dev/null; then
+    chmod 755 "$tmp"
+    MP_BOOTSTRAPPED=1 exec bash "$tmp" "$@"
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
+escalate_or_portable() {  # become root through sudo when possible, otherwise continue rootless (portable)
+  (( IS_ROOT )) && return 0
+  SUDO=""
+  if [[ "${MP_ESCALATED:-0}" == 1 || "${MP_PORTABLE:-0}" == 1 || "${MP_NO_SUDO:-0}" == 1 || -z ${SELF:-} ]] \
+     || ! command -v sudo >/dev/null 2>&1; then
+    return 0
+  fi
+  if sudo -n -E true >/dev/null 2>&1; then
+    MP_ESCALATED=1 exec sudo -E bash "$SELF" "$@"
+  fi
+  if [[ -t 0 && "${MP_CLI:-0}" != 1 && "${MP_ASSUME_DEFAULTS:-0}" != 1 ]]; then
+    if confirm "Root gives the most complete install (system packages, Docker nodes). Use sudo now?" y; then
+      MP_ESCALATED=1 exec sudo -E bash "$SELF" "$@"
+    fi
+  fi
+  return 0
+}
+
+ensure_shortcut() {  # keep a copy in our state dir and a `monopanel` command in PATH
+  [[ -n ${SELF:-} && -f $SELF ]] || return 0
+  local target="$MP_HOME/monopanel.sh"
+  if [[ $SELF != "$target" ]]; then
+    cp -f "$SELF" "$target" 2>/dev/null && chmod 755 "$target" || return 0
+    case "$SELF" in "${TMPDIR:-/tmp}"/monopanel.*) rm -f "$SELF" ;; esac
+    SELF="$target"
+  fi
+  mkdir -p "$BIN_DIR" 2>/dev/null || return 0
+  printf '#!/usr/bin/env bash\nexec bash %q "$@"\n' "$target" > "$BIN_DIR/monopanel" 2>/dev/null && chmod 755 "$BIN_DIR/monopanel"
+  return 0
 }
 
 # ----------------------------------------------------------------------------
@@ -2514,47 +2953,51 @@ main() {
   local cmd="${1:-menu}" src
 
   IS_ROOT=0; (( EUID == 0 )) && IS_ROOT=1
-  SUDO=""; if (( ! IS_ROOT )) && command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
+  SUDO=""
   SELF=""; src="${BASH_SOURCE[0]:-$0}"
-  [[ -f $src ]] && SELF="$(readlink -f "$src" 2>/dev/null || echo "$src")"
+  if [[ $src == */* && -f $src ]]; then SELF="$(readlink -f "$src" 2>/dev/null || echo "$src")"; fi
+  detect_platform            # env-only; exported so it survives sudo -E
 
   case "$cmd" in help|-h|--help) print_help; return 0 ;; esac
   [[ $cmd != menu ]] && MP_CLI=1
+
+  bootstrap_self "$@"
 
   # `curl … | bash` gives us a pipe as stdin — read answers from the terminal instead.
   if [[ ! -t 0 ]]; then
     if [[ -r /dev/tty ]] && { : </dev/tty; } 2>/dev/null; then exec </dev/tty; else MP_ASSUME_DEFAULTS=1; fi
   fi
 
-  # Most steps need root: offer to re-launch through sudo when we can.
-  if (( ! IS_ROOT )) && [[ -n $SUDO && -n $SELF && "${MP_NO_SUDO:-0}" != 1 ]]; then
-    if [[ "${MP_CLI:-0}" == 1 ]] || confirm "Not running as root — re-launch with sudo?" y; then
-      exec sudo -E bash "$SELF" "$@"
-    fi
-  fi
+  escalate_or_portable "$@"
 
   init_env || return 1
   detect_system
+  ensure_shortcut
+  if (( ! IS_ROOT )) && [[ $cmd != status && $cmd != logs && $cmd != stop ]]; then
+    warn "No root access — using the portable runtime (FrankenPHP + Node tarball, external database)."
+    note "System packages, local MariaDB, nginx and Docker nodes need root/sudo."
+  fi
 
   case "$cmd" in
-    menu)         trap 'printf "\n"; warn "Interrupted — use option 0 to exit."' INT; main_menu ;;
-    install)      install_panel ;;
-    run-prod|run) run_panel production ;;
-    run-dev)      run_panel development ;;
-    stop)         stop_panel ;;
-    restart)      restart_panel ;;
-    update)       update_panel ;;
-    admin)        create_admin ;;
-    node-setup)   node_menu ;;
-    node-start)   start_node ;;
-    node-stop)    stop_node ;;
-    node-sync)    node_resync ;;
-    tunnel)       cloudflared_menu ;;
-    status)       show_status ;;
-    logs)         view_logs ;;
-    backup)       backup_panel ;;
-    self-update)  self_update ;;
-    *)            error "Unknown command: $cmd"; print_help; return 1 ;;
+    menu)            trap 'printf "\n"; warn "Interrupted — use option 0 to exit."' INT; main_menu ;;
+    auto|quick|setup) auto_setup ;;
+    install)         install_panel ;;
+    run-prod|run)    run_panel production ;;
+    run-dev)         run_panel development ;;
+    stop)            stop_panel ;;
+    restart)         restart_panel ;;
+    update)          update_panel ;;
+    admin)           create_admin ;;
+    node-setup)      node_menu ;;
+    node-start)      start_node ;;
+    node-stop)       stop_node ;;
+    node-sync)       node_resync ;;
+    tunnel)          cloudflared_menu ;;
+    status)          show_status ;;
+    logs)            view_logs ;;
+    backup)          backup_panel ;;
+    self-update)     self_update ;;
+    *)               error "Unknown command: $cmd"; print_help; return 1 ;;
   esac
 }
 
