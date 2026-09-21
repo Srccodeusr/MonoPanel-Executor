@@ -13,7 +13,8 @@
 #  Linux VPS or sandbox container — with or without systemd — plus full
 #  node (Wings) setup and Cloudflare Tunnel support.
 #
-#  Panel source : https://github.com/Srccodeusr/MonoPanel   (branch: develop)
+#  Panel source : https://github.com/Srccodeusr/MonoPanel            (branch: develop)
+#  This script  : https://github.com/Srccodeusr/MonoPanel-Executor   (branch: main)
 #  Panel base   : Jexactyl / Pterodactyl (MIT) — full credit to the original
 #                 authors and community.
 #
@@ -50,9 +51,9 @@ MP_AUTHOR="prime.dev1"
 # ----------------------------------------------------------------------------
 REPO_URL_DEFAULT="https://github.com/Srccodeusr/MonoPanel.git"
 BRANCH_DEFAULT="develop"
-# Raw URL of THIS script inside your installer repo (main branch). Example:
-#   https://raw.githubusercontent.com/Srccodeusr/<installer-repo>/main/monopanel.sh
-SCRIPT_URL_DEFAULT=""
+# Raw URL of THIS script inside the installer repo (main branch) — used by
+# "Update this script" (Tools menu / `monopanel.sh self-update`).
+SCRIPT_URL_DEFAULT="https://raw.githubusercontent.com/Srccodeusr/MonoPanel-Executor/main/monopanel.sh"
 WINGS_DATA_DEFAULT="/var/lib/pterodactyl/volumes"
 
 # ----------------------------------------------------------------------------
@@ -308,6 +309,18 @@ default_panel_port() {
   printf '8080'
 }
 
+normalize_timezone() {  # prints the canonical tz name (case-fixed) or returns 1 when it is not a real timezone
+  local tz="$1" c=""
+  [[ $tz =~ ^[A-Za-z0-9_+/-]+$ ]] || return 1
+  if [[ -n ${PHP_BIN:-} ]]; then
+    TZ_IN="$tz" "$PHP_BIN" -r '$t = getenv("TZ_IN"); foreach (DateTimeZone::listIdentifiers(DateTimeZone::ALL_WITH_BC) as $i) { if (strcasecmp($i, $t) === 0) { echo $i; exit(0); } } exit(1);' 2>/dev/null
+    return $?
+  fi
+  c="$(find /usr/share/zoneinfo \( -type f -o -type l \) -ipath "/usr/share/zoneinfo/$tz" 2>/dev/null | head -n1)"
+  [[ -n $c ]] || return 1
+  printf '%s' "${c#/usr/share/zoneinfo/}"
+}
+
 detect_timezone() {
   local tz=""
   [[ -r /etc/timezone ]] && tz="$(head -n1 /etc/timezone 2>/dev/null)"
@@ -361,10 +374,27 @@ policy_block() {  # stop apt from auto-starting daemons in non-systemd container
 }
 policy_unblock() { if (( POLICY_MADE )); then rm -f /usr/sbin/policy-rc.d; POLICY_MADE=0; fi; }
 
+APT_OPTS=(-o DPkg::Lock::Timeout=180 -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+
+apt_busy() { command -v pgrep >/dev/null 2>&1 && pgrep -x 'apt|apt-get|aptitude|dpkg|unattended-upgr' >/dev/null 2>&1; }
+
+apt_wait_free() {  # fresh VPSs often run first-boot updates that hold the dpkg lock
+  [[ $PKG == apt ]] || return 0
+  local waited=0 shown=0
+  while apt_busy && (( waited < 600 )); do
+    (( shown )) || { warn "Another package manager is running (probably first-boot updates) — waiting for it to finish…"; shown=1; }
+    sleep 3; waited=$(( waited + 3 ))
+  done
+  (( shown )) && { apt_busy && warn "Still busy after 10 minutes — continuing anyway." || success "Package manager is free."; }
+  return 0
+}
+
 pkg_update() {
   (( PKG_UPDATED )) && return 0
   case "$PKG" in
-    apt) run_root env DEBIAN_FRONTEND=noninteractive apt-get update -y >>"$INSTALL_LOG" 2>&1 ;;
+    apt) apt_wait_free
+         info "Refreshing package lists (apt-get update)…"
+         run_root env DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" update -y >>"$INSTALL_LOG" 2>&1 ;;
     apk) run_root apk update >>"$INSTALL_LOG" 2>&1 ;;
     *)   : ;;
   esac
@@ -378,7 +408,8 @@ pkg_install() {
   case "$PKG" in
     apt)
       policy_block
-      run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confold "$@" >>"$INSTALL_LOG" 2>&1; rc=$?
+      apt_wait_free
+      run_root env DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" install -y -o Dpkg::Options::=--force-confold "$@" >>"$INSTALL_LOG" 2>&1; rc=$?
       policy_unblock ;;
     dnf) run_root dnf install -y "$@" >>"$INSTALL_LOG" 2>&1; rc=$? ;;
     yum) run_root yum install -y "$@" >>"$INSTALL_LOG" 2>&1; rc=$? ;;
@@ -401,29 +432,21 @@ pkg_install_optional() { pkg_install "$@" || warn "Optional package(s) unavailab
 
 ensure_base_deps() {
   step "Base packages"
-  local need=() nice=() c
+  local need=() c
   for c in curl git tar unzip openssl; do command -v "$c" >/dev/null 2>&1 || need+=("$c"); done
   [[ -d /etc/ssl/certs ]] || need+=(ca-certificates)
-  # Nice-to-have (port checks / process listing) — never fatal.
-  case "$PKG" in
-    apt)     command -v ss >/dev/null 2>&1 || nice+=(iproute2); command -v ps >/dev/null 2>&1 || nice+=(procps) ;;
-    dnf|yum) command -v ss >/dev/null 2>&1 || nice+=(iproute);  command -v ps >/dev/null 2>&1 || nice+=(procps-ng) ;;
-    apk)     command -v ss >/dev/null 2>&1 || nice+=(iproute2); command -v ps >/dev/null 2>&1 || nice+=(procps)
-             command -v bash >/dev/null 2>&1 || need+=(bash) ;;
-  esac
+  if [[ $PKG == apk ]]; then command -v bash >/dev/null 2>&1 || need+=(bash); fi
   if (( ${#need[@]} == 0 )); then
     success "curl, git, tar, unzip, openssl already present."
-  else
-    need_root "Installing packages (${need[*]})" || return 1
-    if [[ $PKG == none ]]; then
-      error "Missing: ${need[*]} — and no supported package manager (apt/dnf/yum/apk) was found."
-      warn "Install PHP >= 8.4 (+fpm), Composer, Node >= 18, nginx, MariaDB, git, curl manually, then re-run."
-      return 1
-    fi
-    pkg_install_logged "Installing: ${need[*]}" "${need[@]}" || return 1
+    return 0
   fi
-  if (( ${#nice[@]} && IS_ROOT )) && [[ $PKG != none ]]; then pkg_install "${nice[@]}" >/dev/null 2>&1; fi
-  return 0
+  need_root "Installing packages (${need[*]})" || return 1
+  if [[ $PKG == none ]]; then
+    error "Missing: ${need[*]} — and no supported package manager (apt/dnf/yum/apk) was found."
+    warn "Install PHP >= 8.4 (+fpm), Composer, Node >= 18, nginx, MariaDB, git, curl manually, then re-run."
+    return 1
+  fi
+  pkg_install_logged "Installing: ${need[*]}" "${need[@]}"
 }
 
 # ----------------------------------------------------------------------------
@@ -1057,7 +1080,9 @@ setup_env() {  # expects: W_URL W_TZ W_EMAIL DB_HOST DB_PORT DB_NAME DB_USER DB_
   [[ -n "$(env_get APP_KEY)" ]]      || env_set APP_KEY "base64:$(openssl rand -base64 32)"
   [[ -n "$(env_get HASHIDS_SALT)" ]] || env_set HASHIDS_SALT "$(rand_alnum 20)"
   env_set APP_URL "$W_URL"
-  env_set APP_TIMEZONE "$W_TZ"
+  local tzv; tzv="$(normalize_timezone "$W_TZ")" || tzv=""
+  if [[ -z $tzv ]]; then warn "Timezone '$W_TZ' is not valid for PHP — using UTC."; tzv="UTC"; fi
+  env_set APP_TIMEZONE "$tzv"
   env_set APP_SERVICE_AUTHOR "$W_EMAIL"
   env_set APP_ENVIRONMENT_ONLY "false"
   env_set DB_CONNECTION "mysql"
@@ -1340,7 +1365,16 @@ install_panel() {
   W_URL="$(ask "Panel URL (what users type in the browser)" "$def_url")"
   W_URL="${W_URL%/}"
   [[ $W_URL =~ ^https?:// ]] || { error "The URL must start with http:// or https://"; press_enter; return 1; }
-  W_TZ="$(ask "Timezone" "$(env_get APP_TIMEZONE "$(detect_timezone)")")"
+  local tz_def tz_try tz_ok="" n
+  tz_def="$(env_get APP_TIMEZONE "$(detect_timezone)")"
+  for n in 1 2 3; do
+    tz_try="$(ask "Timezone (Region/City, e.g. UTC, Asia/Kolkata, America/New_York)" "$tz_def")"
+    if tz_ok="$(normalize_timezone "$tz_try")" && [[ -n $tz_ok ]]; then break; fi
+    tz_ok=""
+    warn "'$tz_try' is not a valid timezone — an invalid value would break the panel. Use the Region/City form."
+  done
+  if [[ -z $tz_ok ]]; then warn "Falling back to UTC (change APP_TIMEZONE in the panel settings later)."; tz_ok="UTC"; fi
+  W_TZ="$tz_ok"
   def_email="$(env_get APP_SERVICE_AUTHOR "")"
   W_EMAIL="$(ask "Admin / egg-author email" "${def_email:-admin@example.com}")"
 
@@ -2338,8 +2372,8 @@ cloudflared_menu() {
 self_update() {
   banner; step "Updating this script"
   if [[ -z $SCRIPT_URL ]]; then
-    note "Set the raw URL of monopanel.sh in your installer repo (main branch), e.g."
-    note "https://raw.githubusercontent.com/Srccodeusr/<installer-repo>/main/monopanel.sh"
+    note "Enter the raw URL of monopanel.sh in your installer repo (main branch), e.g."
+    note "https://raw.githubusercontent.com/Srccodeusr/MonoPanel-Executor/main/monopanel.sh"
     SCRIPT_URL="$(ask "Script URL" "")"
     [[ -n $SCRIPT_URL ]] || { press_enter; return 0; }
     cfg_set SCRIPT_URL "$SCRIPT_URL"
